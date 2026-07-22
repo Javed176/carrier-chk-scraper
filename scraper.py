@@ -85,7 +85,7 @@ def get_user_settings(email):
     return 250.00, 3.0
 
 # --- CARRIERCHK API UTILITIES WITH ROBUST RETRIES ---
-def get_carrier_info(mc_number, token, retries=4):
+def get_carrier_info(mc_number, token, retries=6):
     url = "https://carrierchk.com/api/carrier"
     params = {
         "type": "mc",
@@ -99,18 +99,29 @@ def get_carrier_info(mc_number, token, retries=4):
 
     for attempt in range(retries):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=(4.0, 8.0))
+            response = requests.get(url, params=params, headers=headers, timeout=(5.0, 10.0))
             if response.status_code == 200:
                 data = response.json()
-                # Ensure the payload actually contains carrier data or explicit confirmation
-                if isinstance(data, dict):
-                    if "carrier" in data or "error" in data or "status" in data:
-                        return data
+                if isinstance(data, dict) and ("carrier" in data or "error" in data):
+                    return data
+            elif response.status_code == 429:
+                # If explicitly rate limited, back off progressively
+                time.sleep(2.0 * (attempt + 1))
+                continue
             
-            # Exponential backoff on rate-limit or soft block
+            # Brief backoff for general dropped connection hiccup
             time.sleep(1.0 * (attempt + 1))
         except requests.exceptions.RequestException:
-            time.sleep(1.0 * (attempt + 1))
+            time.sleep(1.5 * (attempt + 1))
+
+    # Fallback to force one last deep try instead of failing
+    try:
+        time.sleep(3.0)
+        final_resp = requests.get(url, params=params, headers=headers, timeout=10.0)
+        if final_resp.status_code == 200:
+            return final_resp.json()
+    except Exception:
+        pass
 
     return "API_ERROR"
 
