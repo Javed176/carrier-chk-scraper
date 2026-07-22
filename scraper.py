@@ -10,12 +10,21 @@ from supabase import create_client, Client
 st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 
 # --- SUPABASE & TOKEN CONFIGURATION ---
-# Reads from os.environ first, then falls back to st.secrets
-SUPABASE_URL = os.environ.get("https://vhudqthehrjttbcqluat.supabase.co") or st.secrets.get("https://vhudqthehrjttbcqluat.supabase.co", "")
-SUPABASE_KEY = os.environ.get("sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7") or st.secrets.get("sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7", "")
+# Reads from os.environ, st.secrets, or defaults directly to your provided credentials
+SUPABASE_URL = (
+    os.environ.get("SUPABASE_URL") 
+    or st.secrets.get("SUPABASE_URL", "") 
+    or "https://vhudqthehrjttbcqluat.supabase.co"
+)
+
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_KEY") 
+    or st.secrets.get("SUPABASE_KEY", "") 
+    or "sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7"
+)
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("🔑 Database configuration missing! Please add 'SUPABASE_URL' and 'SUPABASE_KEY' to your Streamlit Cloud Secrets.")
+    st.error("🔑 Database configuration missing! Please check your Supabase credentials.")
     st.stop()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
