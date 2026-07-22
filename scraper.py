@@ -10,7 +10,6 @@ from supabase import create_client, Client
 st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 
 # --- SUPABASE & TOKEN CONFIGURATION ---
-# Reads from os.environ, st.secrets, or defaults directly to your provided credentials
 SUPABASE_URL = (
     os.environ.get("SUPABASE_URL") 
     or st.secrets.get("SUPABASE_URL", "") 
@@ -85,8 +84,8 @@ def get_user_settings(email):
         print(f"Error fetching user settings: {e}")
     return 250.00, 3.0
 
-# --- CARRIERCHK API UTILITIES ---
-def get_carrier_info(mc_number, token):
+# --- CARRIERCHK API UTILITIES WITH AUTO-RETRY ---
+def get_carrier_info(mc_number, token, retries=3):
     url = "https://carrierchk.com/api/carrier"
     params = {
         "type": "mc",
@@ -97,14 +96,25 @@ def get_carrier_info(mc_number, token):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
-    try:
-        # (connect_timeout, read_timeout) - Drops dead links in 3s, allows 7s for response
-        response = requests.get(url, params=params, headers=headers, timeout=(3.0, 7.0))
-        if response.status_code == 200:
-            return response.json()
-        return None
-    except requests.exceptions.RequestException:
-        return None
+
+    for attempt in range(retries):
+        try:
+            # (connect_timeout, read_timeout)
+            response = requests.get(url, params=params, headers=headers, timeout=(3.0, 7.0))
+            if response.status_code == 200:
+                data = response.json()
+                # Check if API returned a valid payload
+                if data and isinstance(data, dict):
+                    return data
+            elif response.status_code == 429:
+                # Rate limited by CarrierChk - back off briefly and retry
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                time.sleep(0.5)
+        except requests.exceptions.RequestException:
+            time.sleep(0.5)
+
+    return None
 
 def parse_carrier_data(mc_number, raw_data):
     if not raw_data or not isinstance(raw_data, dict) or "carrier" not in raw_data or not raw_data["carrier"]:
@@ -119,7 +129,7 @@ def parse_carrier_data(mc_number, raw_data):
     
     c = raw_data.get("carrier", {})
     
-    # Check multiple active status indicators returned by FMCSA / CarrierChk
+    # Check all possible active indicators returned by FMCSA / CarrierChk
     status_code = str(c.get("status_code", "")).upper()
     allowed_to_operate = str(c.get("allowed_to_operate", "")).upper()
     common_auth = str(c.get("common_authority_status", "")).upper()
@@ -570,7 +580,7 @@ if not show_admin_panel:
         
         st.session_state.last_mc_log = int(st.session_state.current_mc)
         
-        # Query CarrierChk API
+        # Query CarrierChk API with retries
         raw_info = get_carrier_info(target_mc, CARRIER_TOKEN)
         parsed_row = parse_carrier_data(target_mc, raw_info)
         
