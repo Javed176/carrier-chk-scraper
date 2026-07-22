@@ -98,15 +98,16 @@ def get_carrier_info(mc_number, token):
         "Accept": "application/json"
     }
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=5.0)
+        # (connect_timeout, read_timeout) - Drops dead links in 3s, allows 7s for response
+        response = requests.get(url, params=params, headers=headers, timeout=(3.0, 7.0))
         if response.status_code == 200:
             return response.json()
         return None
-    except Exception:
+    except requests.exceptions.RequestException:
         return None
 
 def parse_carrier_data(mc_number, raw_data):
-    if not raw_data or "carrier" not in raw_data:
+    if not raw_data or not isinstance(raw_data, dict) or "carrier" not in raw_data or not raw_data["carrier"]:
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND / DEAD NUMBER",
@@ -117,8 +118,26 @@ def parse_carrier_data(mc_number, raw_data):
         }
     
     c = raw_data.get("carrier", {})
-    status_code = c.get("status_code", "")
-    status = "🟢 ACTIVE" if status_code == "A" else f"🔴 INACTIVE ({status_code})" if status_code else "❌ INVALID"
+    
+    # Check multiple active status indicators returned by FMCSA / CarrierChk
+    status_code = str(c.get("status_code", "")).upper()
+    allowed_to_operate = str(c.get("allowed_to_operate", "")).upper()
+    common_auth = str(c.get("common_authority_status", "")).upper()
+    contract_auth = str(c.get("contract_authority_status", "")).upper()
+    
+    is_active = (
+        status_code == "A" 
+        or allowed_to_operate == "Y" 
+        or "ACTIVE" in common_auth 
+        or "ACTIVE" in contract_auth
+    )
+    
+    if is_active:
+        status = "🟢 ACTIVE"
+    elif status_code:
+        status = f"🔴 INACTIVE ({status_code})"
+    else:
+        status = "🔴 INACTIVE"
     
     phone = c.get("phone") or c.get("cell_phone") or "N/A"
     
