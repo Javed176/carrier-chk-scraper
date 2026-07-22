@@ -10,21 +10,18 @@ from supabase import create_client, Client
 st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 
 # --- SUPABASE & TOKEN CONFIGURATION ---
-SUPABASE_URL = os.environ.get("https://vhudqthehrjttbcqluat.supabase.co")
-SUPABASE_KEY = os.environ.get("sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7")
+# Reads from os.environ first, then falls back to st.secrets
+SUPABASE_URL = os.environ.get("https://vhudqthehrjttbcqluat.supabase.co") or st.secrets.get("https://vhudqthehrjttbcqluat.supabase.co", "")
+SUPABASE_KEY = os.environ.get("sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7") or st.secrets.get("sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7", "")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("🔑 Database configuration missing! Please add 'SUPABASE_URL' and 'SUPABASE_KEY' to your environment or secrets.")
+    st.error("🔑 Database configuration missing! Please add 'SUPABASE_URL' and 'SUPABASE_KEY' to your Streamlit Cloud Secrets.")
     st.stop()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Fetch Carrier Token from Secrets or Environment
-CARRIER_TOKEN = os.environ.get("CARRIER_TOKEN", "3243d1219423e4ea")
-try:
-    CARRIER_TOKEN = st.secrets.get("CARRIER_TOKEN", CARRIER_TOKEN)
-except Exception:
-    pass
+# Fetch Carrier Token from Environment or Secrets
+CARRIER_TOKEN = os.environ.get("CARRIER_TOKEN") or st.secrets.get("CARRIER_TOKEN", "3243d1219423e4ea")
 
 # --- BACKEND DATABASE UTILITIES ---
 def log_activity(email, action, detail=""):
