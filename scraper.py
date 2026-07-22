@@ -84,8 +84,8 @@ def get_user_settings(email):
         print(f"Error fetching user settings: {e}")
     return 250.00, 3.0
 
-# --- CARRIERCHK API UTILITIES WITH AUTO-RETRY ---
-def get_carrier_info(mc_number, token, retries=3):
+# --- CARRIERCHK API UTILITIES WITH ROBUST RETRIES ---
+def get_carrier_info(mc_number, token, retries=4):
     url = "https://carrierchk.com/api/carrier"
     params = {
         "type": "mc",
@@ -93,30 +93,38 @@ def get_carrier_info(mc_number, token, retries=3):
         "token": token
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
     }
 
     for attempt in range(retries):
         try:
-            # (connect_timeout, read_timeout)
-            response = requests.get(url, params=params, headers=headers, timeout=(3.0, 7.0))
+            response = requests.get(url, params=params, headers=headers, timeout=(4.0, 8.0))
             if response.status_code == 200:
                 data = response.json()
-                # Check if API returned a valid payload
-                if data and isinstance(data, dict):
-                    return data
-            elif response.status_code == 429:
-                # Rate limited by CarrierChk - back off briefly and retry
-                time.sleep(1.5 * (attempt + 1))
-            else:
-                time.sleep(0.5)
+                # Ensure the payload actually contains carrier data or explicit confirmation
+                if isinstance(data, dict):
+                    if "carrier" in data or "error" in data or "status" in data:
+                        return data
+            
+            # Exponential backoff on rate-limit or soft block
+            time.sleep(1.0 * (attempt + 1))
         except requests.exceptions.RequestException:
-            time.sleep(0.5)
+            time.sleep(1.0 * (attempt + 1))
 
-    return None
+    return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
+    if raw_data == "API_ERROR":
+        return {
+            "MC Number": f"MC-{mc_number}",
+            "Carrier Name": "⚠️ API THROTTLED (RETRY NEEDED)",
+            "Operating Status": "⚠️ UNKNOWN",
+            "Phone Number": "N/A",
+            "Email Address": "N/A",
+            "Location": "N/A"
+        }
+
     if not raw_data or not isinstance(raw_data, dict) or "carrier" not in raw_data or not raw_data["carrier"]:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -129,7 +137,6 @@ def parse_carrier_data(mc_number, raw_data):
     
     c = raw_data.get("carrier", {})
     
-    # Check all possible active indicators returned by FMCSA / CarrierChk
     status_code = str(c.get("status_code", "")).upper()
     allowed_to_operate = str(c.get("allowed_to_operate", "")).upper()
     common_auth = str(c.get("common_authority_status", "")).upper()
@@ -580,14 +587,13 @@ if not show_admin_panel:
         
         st.session_state.last_mc_log = int(st.session_state.current_mc)
         
-        # Query CarrierChk API with retries
         raw_info = get_carrier_info(target_mc, CARRIER_TOKEN)
         parsed_row = parse_carrier_data(target_mc, raw_info)
         
         st.session_state.scraped_rows.append(parsed_row)
         
         st.session_state.current_mc += 1
-        safety_delay_seconds = current_delay_ms / 1000.0
+        safety_delay_seconds = max(0.35, current_delay_ms / 1000.0)
         time.sleep(safety_delay_seconds)
         st.rerun()
 
