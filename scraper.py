@@ -105,16 +105,13 @@ def get_carrier_info(mc_number, token, retries=6):
                 if isinstance(data, dict) and ("carrier" in data or "error" in data):
                     return data
             elif response.status_code == 429:
-                # If explicitly rate limited, back off progressively
                 time.sleep(2.0 * (attempt + 1))
                 continue
             
-            # Brief backoff for general dropped connection hiccup
             time.sleep(1.0 * (attempt + 1))
         except requests.exceptions.RequestException:
             time.sleep(1.5 * (attempt + 1))
 
-    # Fallback to force one last deep try instead of failing
     try:
         time.sleep(3.0)
         final_resp = requests.get(url, params=params, headers=headers, timeout=10.0)
@@ -354,7 +351,7 @@ if show_admin_panel and st.session_state.is_admin:
     adm_tab1, adm_tab2, adm_tab3 = st.tabs(["👥 User Account Management", "📊 30-Day Activity logs", "⚙️ System Configuration"])
     
     with adm_tab1:
-        st.subheader("Add New User Account")
+        st.subheader("Add Single User Account")
         col_add1, col_add2, col_add3 = st.columns(3)
         with col_add1:
             new_email = st.text_input("New User Email:", placeholder="driver@company.com", key="n_email").strip().lower()
@@ -374,25 +371,33 @@ if show_admin_panel and st.session_state.is_admin:
         with col_add7:
             new_secs = st.number_input("Session Seconds:", min_value=0, max_value=59, value=0, step=1, key="n_secs")
             
-        if st.button("➕ Register User Account", use_container_width=True):
+        if st.button("➕ Register Single User Account", use_container_width=True):
             if new_email and new_pass:
                 try:
-                    role_bool = True if new_role == "Super Admin" else False
-                    total_hours_decimal = float(new_hrs) + (float(new_mins) / 60.0) + (float(new_secs) / 3600.0)
-                    
-                    if total_hours_decimal <= 0.0:
-                        st.error("Session lockout duration must be greater than 0 seconds.")
+                    # Check if user already exists
+                    existing_user = supabase.table("users").select("email").eq("email", new_email).execute().data
+                    if existing_user:
+                        st.error(f"User with email '{new_email}' already exists!")
                     else:
-                        supabase.table("users").insert({
-                            "email": new_email,
-                            "password": new_pass,
-                            "is_admin": role_bool,
-                            "delay_ms": float(new_delay),
-                            "session_duration_hours": total_hours_decimal
-                        }).execute()
-                        st.success(f"Successfully registered account for {new_email}!")
-                        time.sleep(1)
-                        st.rerun()
+                        role_bool = True if new_role == "Super Admin" else False
+                        total_hours_decimal = float(new_hrs) + (float(new_mins) / 60.0) + (float(new_secs) / 3600.0)
+                        
+                        if total_hours_decimal <= 0.0:
+                            st.error("Session lockout duration must be greater than 0 seconds.")
+                        else:
+                            # Insert single user record into Supabase
+                            supabase.table("users").insert({
+                                "email": new_email,
+                                "password": new_pass,
+                                "is_admin": role_bool,
+                                "delay_ms": float(new_delay),
+                                "session_duration_hours": total_hours_decimal
+                            }).execute()
+                            
+                            log_activity(st.session_state.current_user, "add_user", f"Added user: {new_email}")
+                            st.success(f"Successfully registered single account for {new_email}!")
+                            time.sleep(1)
+                            st.rerun()
                 except Exception as e:
                     st.error(f"Error registering user: {str(e)}")
             else:
