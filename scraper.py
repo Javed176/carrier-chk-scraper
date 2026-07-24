@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 import os
 import time
-import uuid  # Added for active session tracking
+import uuid
 from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
@@ -221,7 +221,7 @@ def force_logout(reason="Session Auto-Expired"):
             )
         log_activity(st.session_state.current_user, "logout", reason)
         
-        # Clear active session token from DB on clean exit
+        # Clear active session token from DB on exit
         try:
             supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
         except Exception:
@@ -239,16 +239,16 @@ def force_logout(reason="Session Auto-Expired"):
     st.session_state.last_mc_log = None
     st.session_state.last_db_check = 0.0
 
-# --- CONCURRENCY & MULTI-TAB CHECKER ---
+# --- STRICT SINGLE-SESSION CHECKER ---
 def verify_active_session():
-    """Ensures this tab holds the current valid session token in DB."""
+    """Validates session token in DB against local tab token."""
     if st.session_state.authenticated and st.session_state.current_user:
         try:
             res = supabase.table("users").select("active_session_id").eq("email", st.session_state.current_user).execute()
             if res.data:
                 db_token = res.data[0].get("active_session_id")
-                # If DB token changed, another tab or device logged in!
-                if db_token and db_token != st.session_state.session_token:
+                # Token mismatch = logged in from another tab or device
+                if not db_token or db_token != st.session_state.session_token:
                     return False
         except Exception as e:
             print(f"Session check error: {e}")
@@ -273,10 +273,10 @@ if not st.session_state.authenticated:
         user_records = response.data
         
         if user_records and user_records[0]["password"] == password_input:
-            # Generate Unique Session ID for this tab session
+            # Generate Unique Session ID for this login
             unique_session_token = str(uuid.uuid4())
             
-            # Update DB with new session token (invalidates any older active session)
+            # Update DB with new session token (invalidates any older active tabs)
             supabase.table("users").update({"active_session_id": unique_session_token}).eq("email", email_input).execute()
 
             st.session_state.scraped_rows = []
@@ -299,9 +299,9 @@ if not st.session_state.authenticated:
             st.error("Access denied: Invalid credentials.")
     st.stop()
 
-# --- MULTI-TAB / CONCURRENCY VALIDATION ---
+# --- MULTI-TAB & CONCURRENCY ENFORCEMENT ---
 if not verify_active_session():
-    st.error("⚠️ Account session kicked: You logged in from another tab, browser, or device.")
+    st.error("⚠️ Account Session Kicked: You logged in from another tab, browser, or device.")
     st.session_state.authenticated = False
     st.session_state.current_user = None
     st.session_state.session_token = None
@@ -657,10 +657,10 @@ if not show_admin_panel:
     st.markdown("---")
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
-        tab1, tab2, tab3 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Full Info)", "📧 Raw Email List"])
+        tab1, tab2, tab3 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Active Only)", "📧 Raw Active Email List"])
         
         with tab1:
-            st.subheader("Master History Sheet")
+            st.subheader("Master History Sheet (All Results)")
             st.dataframe(base_df, use_container_width=True)
             
             master_csv = base_df.to_csv(index=False).encode('utf-8')
@@ -674,33 +674,37 @@ if not show_admin_panel:
             )
             
         with tab2:
-            st.subheader("Clean Target Pitch Sheet")
+            st.subheader("Clean Target Pitch Sheet (ACTIVE Carriers Only)")
+            # Filter strictly for ACTIVE carriers with valid email addresses
             leads_df = base_df[
+                (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
                 (base_df["Email Address"] != "N/A") & 
                 (base_df["Email Address"] != "Not Listed") & 
                 (base_df["Email Address"].str.contains("@", na=False))
             ]
             
             if not leads_df.empty:
-                st.success(f"Filtered out {len(leads_df)} verified carrier targets with full records!")
+                st.success(f"Found {len(leads_df)} active carrier targets with full contact records!")
                 st.dataframe(leads_df, use_container_width=True)
                 
                 leads_csv = leads_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 Export Clean Email Pitch Sheet to CSV",
+                    label="📥 Export Clean Active Email Pitch Sheet to CSV",
                     data=leads_csv,
-                    file_name="Verified_Carrier_Emails.csv",
+                    file_name="Active_Carrier_Emails.csv",
                     mime="text/csv",
                     use_container_width=True,
                     key="leads_download"
                 )
             else:
-                st.info("No valid email addresses identified in this sequence run yet.")
+                st.info("No active carrier leads with email addresses identified in this sequence run yet.")
 
         with tab3:
-            st.subheader("Isolated Email Blast Column")
+            st.subheader("Isolated Email Blast Column (ACTIVE Carriers Only)")
             
+            # Filter strictly for emails belonging to ACTIVE carriers
             valid_emails = base_df[
+                (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
                 (base_df["Email Address"] != "N/A") & 
                 (base_df["Email Address"] != "Not Listed") & 
                 (base_df["Email Address"].str.contains("@", na=False))
@@ -709,22 +713,22 @@ if not show_admin_panel:
             if not valid_emails.empty:
                 just_emails_df = pd.DataFrame({"Email Address": valid_emails})
                 
-                st.success(f"Found {len(just_emails_df)} unique emails for direct copy-pasting!")
+                st.success(f"Found {len(just_emails_df)} unique emails from ACTIVE carriers!")
                 st.dataframe(just_emails_df, use_container_width=True)
                 
                 email_text = "\n".join(just_emails_df["Email Address"].tolist())
-                st.text_area("Copy Raw Emails:", value=email_text, height=150)
+                st.text_area("Copy Raw Active Emails:", value=email_text, height=150)
                 
                 raw_emails_csv = just_emails_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 Export Isolated Email List to CSV",
+                    label="📥 Export Isolated Active Email List to CSV",
                     data=raw_emails_csv,
-                    file_name="Clean_Mailing_List.csv",
+                    file_name="Active_Mailing_List.csv",
                     mime="text/csv",
                     use_container_width=True,
                     key="raw_emails_download"
                 )
             else:
-                st.info("No valid email leads found to populate the mailing column yet.")
+                st.info("No active carrier emails found to populate the mailing column yet.")
     else:
         st.info("No data rows collected in this run yet. Click 'Start Sequence' to begin harvesting.")
