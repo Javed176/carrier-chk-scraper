@@ -1,8 +1,8 @@
-import requests
-import pandas as pd
 import os
 import time
 import uuid
+import requests
+import pandas as pd
 from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
@@ -10,27 +10,19 @@ from supabase import create_client, Client
 
 st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 
-# --- SUPABASE & TOKEN CONFIGURATION ---
-SUPABASE_URL = (
-    os.environ.get("SUPABASE_URL") 
-    or st.secrets.get("SUPABASE_URL", "") 
-    or "https://vhudqthehrjttbcqluat.supabase.co"
-)
-
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_KEY") 
-    or st.secrets.get("SUPABASE_KEY", "") 
-    or "sb_publishable_eHNwQ5RLe8oi1uZ7If3ODg_aZR66HJ7"
-)
+# --- SAFE SECRETS & ENVIRONMENT CONFIGURATION ---
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
+CARRIER_TOKEN = st.secrets.get("CARRIER_TOKEN") or os.environ.get("CARRIER_TOKEN")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("🔑 Database configuration missing! Please check your Supabase credentials.")
+    st.error("🔑 Database configuration missing! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
     st.stop()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not CARRIER_TOKEN:
+    st.warning("⚠️ CARRIER_TOKEN is missing from secrets. API searches may fail.")
 
-# Fetch Carrier Token from Environment or Secrets
-CARRIER_TOKEN = os.environ.get("CARRIER_TOKEN") or st.secrets.get("CARRIER_TOKEN", "3243d1219423e4ea")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- BACKEND DATABASE UTILITIES ---
 def log_activity(email, action, detail=""):
@@ -675,7 +667,6 @@ if not show_admin_panel:
             
         with tab2:
             st.subheader("Clean Target Pitch Sheet (ACTIVE Carriers Only)")
-            # Filter strictly for ACTIVE carriers with valid email addresses
             leads_df = base_df[
                 (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
                 (base_df["Email Address"] != "N/A") & 
@@ -701,8 +692,6 @@ if not show_admin_panel:
 
         with tab3:
             st.subheader("Isolated Email Blast Column (ACTIVE Carriers Only)")
-            
-            # Filter strictly for emails belonging to ACTIVE carriers
             valid_emails = base_df[
                 (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
                 (base_df["Email Address"] != "N/A") & 
