@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import os
 import time
+import uuid  # Added for active session tracking
 from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
@@ -188,6 +189,8 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "current_user" not in st.session_state:
     st.session_state.current_user = None
+if "session_token" not in st.session_state:
+    st.session_state.session_token = None
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 if "login_time" not in st.session_state:
@@ -217,8 +220,16 @@ def force_logout(reason="Session Auto-Expired"):
                 f"Searched MC-{st.session_state.start_mc_log} to MC-{st.session_state.last_mc_log}"
             )
         log_activity(st.session_state.current_user, "logout", reason)
-        st.session_state.authenticated = False
+        
+        # Clear active session token from DB on clean exit
+        try:
+            supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
+        except Exception:
+            pass
+
+    st.session_state.authenticated = False
     st.session_state.current_user = None
+    st.session_state.session_token = None
     st.session_state.is_admin = False
     st.session_state.login_time = None
     st.session_state.running = False
@@ -227,6 +238,21 @@ def force_logout(reason="Session Auto-Expired"):
     st.session_state.start_mc_log = None
     st.session_state.last_mc_log = None
     st.session_state.last_db_check = 0.0
+
+# --- CONCURRENCY & MULTI-TAB CHECKER ---
+def verify_active_session():
+    """Ensures this tab holds the current valid session token in DB."""
+    if st.session_state.authenticated and st.session_state.current_user:
+        try:
+            res = supabase.table("users").select("active_session_id").eq("email", st.session_state.current_user).execute()
+            if res.data:
+                db_token = res.data[0].get("active_session_id")
+                # If DB token changed, another tab or device logged in!
+                if db_token and db_token != st.session_state.session_token:
+                    return False
+        except Exception as e:
+            print(f"Session check error: {e}")
+    return True
 
 # --- LOGIN GATEWAY ---
 if not st.session_state.authenticated:
@@ -247,6 +273,12 @@ if not st.session_state.authenticated:
         user_records = response.data
         
         if user_records and user_records[0]["password"] == password_input:
+            # Generate Unique Session ID for this tab session
+            unique_session_token = str(uuid.uuid4())
+            
+            # Update DB with new session token (invalidates any older active session)
+            supabase.table("users").update({"active_session_id": unique_session_token}).eq("email", email_input).execute()
+
             st.session_state.scraped_rows = []
             st.session_state.current_mc = ""  
             st.session_state.running = False
@@ -255,6 +287,7 @@ if not st.session_state.authenticated:
             
             st.session_state.authenticated = True
             st.session_state.current_user = email_input
+            st.session_state.session_token = unique_session_token
             st.session_state.is_admin = user_records[0].get("is_admin", False)
             st.session_state.login_time = time.time()
             st.session_state.last_db_check = 0.0  
@@ -265,6 +298,15 @@ if not st.session_state.authenticated:
         else:
             st.error("Access denied: Invalid credentials.")
     st.stop()
+
+# --- MULTI-TAB / CONCURRENCY VALIDATION ---
+if not verify_active_session():
+    st.error("⚠️ Account session kicked: You logged in from another tab, browser, or device.")
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+    st.session_state.session_token = None
+    time.sleep(2)
+    st.rerun()
 
 # --- THROTTLED CONFIG RETRIEVAL ---
 now = time.time()
@@ -374,7 +416,6 @@ if show_admin_panel and st.session_state.is_admin:
         if st.button("➕ Register Single User Account", use_container_width=True):
             if new_email and new_pass:
                 try:
-                    # Check if user already exists
                     existing_user = supabase.table("users").select("email").eq("email", new_email).execute().data
                     if existing_user:
                         st.error(f"User with email '{new_email}' already exists!")
@@ -385,7 +426,6 @@ if show_admin_panel and st.session_state.is_admin:
                         if total_hours_decimal <= 0.0:
                             st.error("Session lockout duration must be greater than 0 seconds.")
                         else:
-                            # Insert single user record into Supabase
                             supabase.table("users").insert({
                                 "email": new_email,
                                 "password": new_pass,
