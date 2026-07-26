@@ -105,7 +105,6 @@ def get_carrier_info(mc_number, token, retries=4):
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
-    # 1. API Failure / Rate Limit exhaustion
     if raw_data == "API_ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -117,7 +116,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 2. Inactive docket / Server side timeout
     if isinstance(raw_data, dict) and raw_data.get("inactive_timeout") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -129,7 +127,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 3. Docket Not Found
     if not raw_data or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -164,7 +161,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Extract Carrier / Business Name
     name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").strip().upper()
     if name in ["NONE", "NULL", "", "N/A", "NOT FOUND"]:
         return {
@@ -177,7 +173,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Extract Raw Entity Type
     raw_entity = str(
         c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or c.get("operation_classification") or ""
     ).strip().upper()
@@ -191,7 +186,6 @@ def parse_carrier_data(mc_number, raw_data):
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
-    # Authority Status Check
     common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
     contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
     broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
@@ -200,14 +194,12 @@ def parse_carrier_data(mc_number, raw_data):
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
 
-    # Power units count
     power_units_raw = c.get("power_units") if c.get("power_units") is not None else c.get("powerUnits")
     try:
         pu_count = int(power_units_raw)
     except (ValueError, TypeError):
         pu_count = None
 
-    # Status Determination
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
@@ -223,8 +215,6 @@ def parse_carrier_data(mc_number, raw_data):
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
-
-    # Exact CarrierCheck Badge Matching
     direct_badge = str(c.get("badge") or c.get("entity_badge") or c.get("classification") or "").strip().upper()
     
     if "BROKER" in direct_badge and "CARRIER" not in direct_badge:
@@ -250,7 +240,6 @@ def parse_carrier_data(mc_number, raw_data):
         else:
             entity_label = "BROKER" if ("BROKER" in name or "LOGISTICS" in name) else "CARRIER"
 
-    # Contact & Location Parsing
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
@@ -275,7 +264,7 @@ def parse_carrier_data(mc_number, raw_data):
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
                  ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
-                 ("auto_retry_enabled", False), ("auto_retry_interval", 25)]:
+                 ("auto_retry_enabled", True), ("target_batch_size", 25), ("batch_progress", 0)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -287,6 +276,7 @@ def force_logout(reason="Session Expired"):
         st.session_state[k] = False if isinstance(st.session_state[k], bool) else None
     st.session_state.scraped_rows = []
     st.session_state.current_mc = ""
+    st.session_state.batch_progress = 0
 
 def verify_active_session():
     if st.session_state.authenticated and st.session_state.current_user:
@@ -314,7 +304,7 @@ if not st.session_state.authenticated:
             supabase.table("users").update({"active_session_id": token}).eq("email", email_in).execute()
             st.session_state.update({"authenticated": True, "current_user": email_in, "session_token": token,
                                      "is_admin": res.data[0].get("is_admin", False), "login_time": time.time(),
-                                     "scraped_rows": [], "current_mc": ""})
+                                     "scraped_rows": [], "current_mc": "", "batch_progress": 0})
             log_activity(email_in, "login", "Success")
             st.rerun()
         else: st.error("Access denied.")
@@ -483,27 +473,27 @@ if not show_admin:
     with c2:
         st.metric("Session Speed Enforced", speed_str)
 
-    # --- ADVANCED THROTTLING & AUTO-RETRY SETTINGS ---
-    with st.expander("⚙️ Advanced Throttling & Auto-Retry Settings", expanded=True):
-        col_ar1, col_ar2 = st.columns([1, 1])
-        st.session_state.auto_retry_enabled = col_ar1.checkbox(
-            "🔄 Auto Retry Throttled", 
-            value=st.session_state.get("auto_retry_enabled", False)
-        )
-        st.session_state.auto_retry_interval = col_ar2.number_input(
-            "Check & Auto-Retry Interval (MCs):", 
-            min_value=5, 
-            max_value=200, 
-            value=int(st.session_state.get("auto_retry_interval", 25)), 
+    # --- ADVANCED BATCH & RETRY CONFIGURATION ---
+    with st.expander("⚙️ Batch Limits & Auto-Retry Settings", expanded=True):
+        col_ar1, col_ar2 = st.columns(2)
+        
+        st.session_state.target_batch_size = col_ar1.number_input(
+            "Batch Size (MC Count Per Cycle):", 
+            min_value=1, 
+            max_value=500, 
+            value=int(st.session_state.get("target_batch_size", 25)), 
             step=5
         )
         
-        if st.session_state.auto_retry_enabled:
-            st.warning("⚠️ Warning: Enabling Auto Retry will pause execution when rate limits occur to allow CarrierCheck cool-downs. It might make system slow.")
+        st.session_state.auto_retry_enabled = col_ar2.checkbox(
+            "🔄 Auto-Retry Throttled MCs At End Of Each Batch", 
+            value=st.session_state.get("auto_retry_enabled", True)
+        )
 
     b1, b2, b3, b4 = st.columns(4)
     if b1.button("🚀 Start Sequence", use_container_width=True):
         if st.session_state.current_mc != "":
+            st.session_state.batch_progress = 0
             st.session_state.running = True
             st.rerun()
         else: st.error("Enter MC Number first.")
@@ -532,51 +522,71 @@ if not show_admin:
 
     if b4.button("🗑️ Clear Data", use_container_width=True):
         st.session_state.scraped_rows = []
+        st.session_state.batch_progress = 0
         st.rerun()
 
-    # --- SCRAPING LOOP WITH AUTO-RETRY CHECKPOINT ---
+    # --- SCRAPING LOOP ---
     if st.session_state.running and st.session_state.current_mc != "":
         st_box = st.empty()
-        auto_retry = st.session_state.get("auto_retry_enabled", False)
-        interval = st.session_state.get("auto_retry_interval", 25)
+        target_limit = int(st.session_state.get("target_batch_size", 25))
 
         for _ in range(5):
             if not st.session_state.running: break
+            
             target = str(st.session_state.current_mc)
-            st_box.info(f"⚡ Live Scraping | Target: **MC-{target}**...")
+            st.session_state.batch_progress += 1
+            current_batch_count = st.session_state.batch_progress
+
+            st_box.info(f"⚡ Live Scraping | Target: **MC-{target}** (Item {current_batch_count} of {target_limit} in current batch)...")
             
             raw_info = get_carrier_info(target, CARRIER_TOKEN)
             parsed_record = parse_carrier_data(target, raw_info)
             st.session_state.scraped_rows.append(parsed_record)
             st.session_state.current_mc += 1
 
-            # Auto Retry Checkpoint: Check after every X MCs (e.g., 25)
-            total_collected = len(st.session_state.scraped_rows)
-            if auto_retry and total_collected > 0 and (total_collected % interval == 0):
-                throttled_indices = [
-                    idx for idx, r in enumerate(st.session_state.scraped_rows)
-                    if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
-                    or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
-                ]
-                
-                if throttled_indices:
-                    st_box.warning(f"🔄 Checkpoint reached ({total_collected} MCs). Auto-retrying {len(throttled_indices)} throttled record(s)...")
-                    time.sleep(3.0)  # Wait for API rate limit window to clear
-                    
-                    for count, idx in enumerate(throttled_indices, start=1):
-                        if not st.session_state.running: break
-                        retry_mc = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
-                        st_box.info(f"🔄 Auto-retrying MC-{retry_mc} ({count}/{len(throttled_indices)})...")
-                        
-                        new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
-                        new_parsed = parse_carrier_data(retry_mc, new_raw)
-                        st.session_state.scraped_rows[idx] = new_parsed
-                        time.sleep(1.0)
-                    
-                    st_box.success("✅ Auto-retry completed for current checkpoint!")
-                    time.sleep(1.0)
+            # BATCH COMPLETE CHECKPOINT
+            if current_batch_count >= target_limit:
+                if st.session_state.get("auto_retry_enabled", True):
+                    # ISOLATE AND LOOK BACK ONLY AT THE RECENT BATCH (LAST `target_limit` ITEMS)
+                    total_scraped = len(st.session_state.scraped_rows)
+                    start_idx = max(0, total_scraped - target_limit)
+                    batch_slice = st.session_state.scraped_rows[start_idx:]
 
-            # Circuit breaker cool-down if current single request throttled
+                    # FIND THROTTLED MCs IN THIS SPECIFIC BATCH
+                    throttled_indices = [
+                        start_idx + i for i, r in enumerate(batch_slice)
+                        if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
+                        or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
+                    ]
+
+                    if throttled_indices:
+                        st_box.warning(f"🛑 Batch of {target_limit} MCs complete. Found {len(throttled_indices)} throttled record(s) in this batch. Cooling down 3.5s before retrying...")
+                        time.sleep(3.5)
+                        
+                        for count, idx in enumerate(throttled_indices, start=1):
+                            retry_mc = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
+                            st_box.info(f"🔄 Retrying throttled MC-{retry_mc} ({count}/{len(throttled_indices)} in batch)...")
+                            
+                            new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
+                            new_parsed = parse_carrier_data(retry_mc, new_raw)
+                            st.session_state.scraped_rows[idx] = new_parsed
+                            time.sleep(1.0)
+
+                        st_box.success(f"✅ Batch complete! Retried throttled records. Continuing next batch starting from MC-{st.session_state.current_mc}...")
+                        time.sleep(1.5)
+                    else:
+                        st_box.success(f"✅ Batch complete! 0 throttled records. Continuing next batch starting from MC-{st.session_state.current_mc}...")
+                        time.sleep(1.5)
+                else:
+                    st_box.info(f"🛑 Batch complete! Continuing next batch starting from MC-{st.session_state.current_mc}...")
+                    time.sleep(1.5)
+
+                # RESET COUNTER & AUTO-CONTINUE NEXT BATCH
+                st.session_state.batch_progress = 0
+                st.rerun()
+                break
+
+            # Circuit breaker delay if current request returned throttle warning
             if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
                 st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 3.5s...")
                 time.sleep(3.5)
