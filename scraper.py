@@ -185,7 +185,6 @@ def parse_carrier_data(mc_number, raw_data):
         c.get("badge") or c.get("entity_badge") or c.get("classification") or c.get("badge_type") or ""
     ).strip().upper()
 
-    # Safety wrapper for authority status structures
     def extract_status(val):
         if isinstance(val, dict):
             return str(val.get("status") or val.get("desc") or val.get("value") or "").upper()
@@ -207,12 +206,6 @@ def parse_carrier_data(mc_number, raw_data):
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
 
-    power_units_raw = c.get("power_units") if c.get("power_units") is not None else c.get("powerUnits")
-    try:
-        pu_count = int(power_units_raw)
-    except (ValueError, TypeError):
-        pu_count = None
-
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
@@ -226,21 +219,22 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- ABSOLUTE BADGE-FIRST CLASSIFICATION ENGINE ---
-    if "BROKER" in direct_badge and "CARRIER" not in direct_badge:
-        entity_label = "BROKER"
-    elif "CARRIER" in direct_badge and "BROKER" in direct_badge:
+    # --- PRECISE AUTHORITY & BADGE CLASSIFICATION ENGINE ---
+    is_carrier_auth = has_common_active or has_contract_active
+    is_broker_auth = has_broker_active or "BROKER" in direct_badge or "BROKER" in raw_entity
+
+    if is_carrier_auth and is_broker_auth:
         entity_label = "CARRIER / BROKER"
-    elif "CARRIER" in direct_badge:
-        entity_label = "CARRIER"
-    elif has_common_active or has_contract_active:
-        entity_label = "CARRIER"
-    elif has_broker_active:
+    elif is_broker_auth and not is_carrier_auth:
         entity_label = "BROKER"
-    elif "AUTHORIZED FOR HIRE" in op_class or (pu_count is not None and pu_count >= 0):
+    elif is_carrier_auth:
         entity_label = "CARRIER"
+    elif "CARRIER" in direct_badge and "BROKER" not in direct_badge:
+        entity_label = "CARRIER"
+    elif "BROKER" in direct_badge and "CARRIER" not in direct_badge:
+        entity_label = "BROKER"
     else:
-        if "BROKER" in raw_entity:
+        if "BROKER" in raw_entity or "BROKER" in op_class:
             entity_label = "BROKER"
         else:
             entity_label = "CARRIER"
