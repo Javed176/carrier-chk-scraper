@@ -192,19 +192,21 @@ def parse_carrier_data(mc_number, raw_data):
     else:
         status = "🔴 INACTIVE"
     
-    phone = c.get("phone") or c.get("cell_phone") or "N/A"
+    phone = str(c.get("phone") or c.get("cell_phone") or "N/A")
     
     email = c.get("email_address")
     if not email or str(email).strip() == "":
         email = "Not Listed"
+    else:
+        email = str(email).strip()
     
-    city = c.get("phy_city", "").strip()
-    state = c.get("phy_state", "").strip()
+    city = str(c.get("phy_city", "") or "").strip()
+    state = str(c.get("phy_state", "") or "").strip()
     location = f"{city}, {state}".strip(", ") if city or state else "N/A"
     
     return {
         "MC Number": f"MC-{mc_number}",
-        "Carrier Name": c.get("dba_name") or c.get("legal_name") or "N/A",
+        "Carrier Name": str(c.get("dba_name") or c.get("legal_name") or "N/A"),
         "Entity Type": entity_label,
         "Operating Status": status,
         "Phone Number": phone,
@@ -664,13 +666,13 @@ if not show_admin_panel:
     if col_btn3.button("♻️ Retry Throttled Rows", use_container_width=True):
         throttled_indexes = [
             i for i, r in enumerate(st.session_state.scraped_rows) 
-            if "THROTTLED" in r.get("Carrier Name", "")
+            if "THROTTLED" in str(r.get("Carrier Name", ""))
         ]
         if throttled_indexes:
             status_box_retry = st.empty()
             st.info(f"Retrying {len(throttled_indexes)} throttled rows...")
             for idx in throttled_indexes:
-                raw_mc_clean = st.session_state.scraped_rows[idx]["MC Number"].replace("MC-", "").strip()
+                raw_mc_clean = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
                 status_box_retry.info(f"🔄 Re-fetching MC-{raw_mc_clean}...")
                 raw_info = get_carrier_info(raw_mc_clean, CARRIER_TOKEN)
                 st.session_state.scraped_rows[idx] = parse_carrier_data(raw_mc_clean, raw_info)
@@ -716,9 +718,16 @@ if not show_admin_panel:
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
 
-        # Safeguard: ensure 'Entity Type' exists even if old rows are in session state
+        # Safeguard: ensure essential columns exist and are safely converted to string
         if "Entity Type" not in base_df.columns:
             base_df["Entity Type"] = "CARRIER"
+
+        base_df["Entity Type"] = base_df["Entity Type"].fillna("CARRIER").astype(str)
+        base_df["Operating Status"] = base_df["Operating Status"].fillna("N/A").astype(str)
+        base_df["Carrier Name"] = base_df["Carrier Name"].fillna("N/A").astype(str)
+        base_df["MC Number"] = base_df["MC Number"].fillna("N/A").astype(str)
+        base_df["Location"] = base_df["Location"].fillna("N/A").astype(str)
+        base_df["Email Address"] = base_df["Email Address"].fillna("N/A").astype(str)
 
         # --- DYNAMIC DATA FILTERING SECTION ---
         with st.expander("🔍 Filter Collected Records", expanded=True):
@@ -728,23 +737,26 @@ if not show_admin_panel:
                 search_query = st.text_input("🔎 Search Name or MC:", value="", placeholder="e.g. LOGISTICS or 1800016")
                 
             with col_f2:
-                all_entities = ["ALL"] + sorted([e for e in base_df["Entity Type"].unique() if e != "N/A"])
+                raw_entities = [str(e) for e in base_df["Entity Type"].unique() if str(e) not in ["N/A", "nan", "None", ""]]
+                all_entities = ["ALL"] + sorted(list(set(raw_entities)))
                 selected_entity = st.selectbox("🚛 Filter Entity Type:", all_entities)
 
             with col_f3:
-                all_statuses = ["ALL"] + sorted(list(base_df["Operating Status"].unique()))
+                raw_statuses = [str(s) for s in base_df["Operating Status"].unique() if str(s) not in ["N/A", "nan", "None", ""]]
+                all_statuses = ["ALL"] + sorted(list(set(raw_statuses)))
                 selected_status = st.selectbox("📌 Filter Status:", all_statuses)
                 
             with col_f4:
                 extracted_states = set()
-                for loc in base_df["Location"].dropna():
-                    if "," in loc:
-                        extracted_states.add(loc.split(",")[-1].strip().upper())
-                
-                # Full list of all 50 US States + DC + any extras extracted dynamically
-                all_states_combined = set(ALL_US_STATES).union(extracted_states)
-                all_states = ["ALL"] + sorted(list(all_states_combined))
-                
+                for loc in base_df["Location"]:
+                    loc_str = str(loc)
+                    if "," in loc_str:
+                        st_code = loc_str.split(",")[-1].strip().upper()
+                        if st_code and len(st_code) == 2:
+                            extracted_states.add(st_code)
+
+                all_states_set = set(ALL_US_STATES).union(extracted_states)
+                all_states = ["ALL"] + sorted(list(all_states_set))
                 selected_state = st.selectbox("📍 Filter State:", all_states)
 
         # Apply Filters to Create Filtered DataFrame
