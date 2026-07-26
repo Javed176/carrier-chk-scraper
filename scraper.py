@@ -76,27 +76,22 @@ def get_carrier_info(mc_number, token, retries=1):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     for attempt in range(retries + 1):
         try:
-            # Dynamic response wait: moves on instantly as soon as data arrives, max 10s ceiling
             res = http_session.get(CARRIER_API_URL, params=params, timeout=10.0)
             
             if res.status_code == 200:
                 data = res.json()
                 return data
             elif res.status_code in [404, 400]:
-                # Non-existent carrier dockets
                 return {"not_found": True}
             elif res.status_code in [500, 502, 503, 504]:
-                # FMCSA upstream timeout / gateway error on old inactive dockets
                 return {"inactive_timeout": True}
             elif res.status_code == 429:
-                # Rate limited
                 time.sleep(1.2 * (attempt + 1))
                 continue
             else:
                 if attempt < retries:
                     time.sleep(0.5)
         except requests.exceptions.Timeout:
-            # Reached full 10-second wait limit
             if attempt < retries:
                 time.sleep(0.8)
         except requests.exceptions.RequestException:
@@ -123,7 +118,7 @@ def parse_carrier_data(mc_number, raw_data):
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "INACTIVE / REVOKED DOCKET",
-            "Entity Type": "N/A",
+            "Entity Type": "CARRIER",
             "Operating Status": "🔴 INACTIVE",
             "Phone Number": "N/A",
             "Email Address": "N/A",
@@ -179,7 +174,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Extract Raw Entity Type
+    # Extract Raw Entity Type from API payload
     raw_entity = str(
         c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or c.get("operation_classification") or ""
     ).strip().upper()
@@ -197,6 +192,10 @@ def parse_carrier_data(mc_number, raw_data):
     contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
     broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status")
 
+    # Raw presence of authority records (regardless of whether active or revoked)
+    has_mc_auth_record = (common_auth is not None or contract_auth is not None)
+    has_broker_auth_record = (broker_auth is not None)
+
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
@@ -208,7 +207,7 @@ def parse_carrier_data(mc_number, raw_data):
     except (ValueError, TypeError):
         pu_count = None
 
-    # Status Determination
+    # Operating Status Determination
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
@@ -220,30 +219,30 @@ def parse_carrier_data(mc_number, raw_data):
         has_broker_active
     )
 
-    # Override: Inactive status without active authority values
     if (status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE"] or allowed_op in ["N", "NO"]) and not (has_common_active or has_contract_active or has_broker_active):
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # Entity Type Determination
-    is_broker = (has_broker_active or "BROKER" in raw_entity or "FORWARDER" in raw_entity)
-    is_carrier = (has_common_active or has_contract_active or ("CARRIER" in raw_entity and "BROKER" not in raw_entity))
+    # --- REFINED ENTITY TYPE DETERMINATION ---
+    is_broker = has_broker_auth_record or "BROKER" in raw_entity or "FORWARDER" in raw_entity
+    is_carrier = "CARRIER" in raw_entity or "MOTOR" in raw_entity or has_mc_auth_record or (pu_count is not None and pu_count > 0)
 
-    # Zero fleet size rule: If fleet is 0 and no motor carrier authority, enforce BROKER
-    if pu_count == 0 and not (has_common_active or has_contract_active):
+    # Override for zero-fleet brokers without motor carrier authority
+    if pu_count == 0 and not has_mc_auth_record and ("CARRIER" not in raw_entity):
         is_carrier = False
-        if is_broker or "LOGISTICS" in name or "BROKER" in name or "FREIGHT" in name:
+        if is_broker or "BROKER" in name:
             is_broker = True
 
     if is_broker and is_carrier:
         entity_label = "CARRIER / BROKER"
-    elif is_broker:
-        entity_label = "BROKER"
     elif is_carrier:
         entity_label = "CARRIER"
+    elif is_broker:
+        entity_label = "BROKER"
     else:
-        if "BROKER" in raw_entity or "LOGISTICS" in name or "BROKER" in name:
+        # Strict fallback: default to CARRIER unless BROKER is explicitly in the company name
+        if "BROKER" in name:
             entity_label = "BROKER"
         else:
             entity_label = "CARRIER"
