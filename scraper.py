@@ -71,31 +71,34 @@ def get_user_settings(email):
         pass
     return 300.0, 3.0
 
-# --- API & DYNAMIC WAIT / 7-SEC TIMEOUT LOGIC ---
+# --- API & DYNAMIC WAIT / 10-SEC TIMEOUT LOGIC ---
 def get_carrier_info(mc_number, token, retries=1):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     for attempt in range(retries + 1):
         try:
-            # Dynamic response wait: advances instantly on response, max 7s timeout
-            res = http_session.get(CARRIER_API_URL, params=params, timeout=7.0)
+            # Dynamic response wait: moves on instantly as soon as data arrives, max 10s ceiling
+            res = http_session.get(CARRIER_API_URL, params=params, timeout=10.0)
             
             if res.status_code == 200:
                 data = res.json()
                 return data
-            elif res.status_code == 404:
-                # Immediate explicit handling for non-existent carrier dockets
+            elif res.status_code in [404, 400]:
+                # Non-existent carrier dockets
                 return {"not_found": True}
+            elif res.status_code in [500, 502, 503, 504]:
+                # FMCSA upstream timeout / gateway error on old inactive dockets
+                return {"inactive_timeout": True}
             elif res.status_code == 429:
-                # Server throttle / rate limit
-                time.sleep(1.0 * (attempt + 1))
+                # Rate limited
+                time.sleep(1.2 * (attempt + 1))
                 continue
             else:
                 if attempt < retries:
                     time.sleep(0.5)
         except requests.exceptions.Timeout:
-            # Hit 7-second max timeout threshold
+            # Reached full 10-second wait limit
             if attempt < retries:
-                time.sleep(0.5)
+                time.sleep(0.8)
         except requests.exceptions.RequestException:
             if attempt < retries:
                 time.sleep(0.5)
@@ -103,7 +106,7 @@ def get_carrier_info(mc_number, token, retries=1):
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
-    # 1. Actual Timeout or Throttling after 7 seconds
+    # 1. Genuine API Failure or Rate Limit after 10-sec timeout
     if raw_data == "API_ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -115,7 +118,19 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 2. Non-existent MC / Docket Not Found (HTTP 404 or empty object)
+    # 2. Inactive docket that timed out on FMCSA server side
+    if isinstance(raw_data, dict) and raw_data.get("inactive_timeout") is True:
+        return {
+            "MC Number": f"MC-{mc_number}",
+            "Carrier Name": "INACTIVE / REVOKED DOCKET",
+            "Entity Type": "N/A",
+            "Operating Status": "🔴 INACTIVE",
+            "Phone Number": "N/A",
+            "Email Address": "N/A",
+            "Location": "N/A"
+        }
+
+    # 3. Non-existent MC / Docket Not Found (HTTP 404 or empty object)
     if not raw_data or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -127,7 +142,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Check for payload level "Not Found" or "Error" responses
+    # Payload level error check
     if raw_data.get("error") or raw_data.get("message") == "Not Found":
         return {
             "MC Number": f"MC-{mc_number}",
