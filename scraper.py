@@ -1,8 +1,4 @@
-import os
-import time
-import uuid
-import requests
-import pandas as pd
+import os, time, uuid, requests, pandas as pd
 from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
@@ -10,845 +6,383 @@ from supabase import create_client, Client
 
 st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 
-# --- SAFE SECRETS & ENVIRONMENT CONFIGURATION ---
+# --- CONFIGURATION ---
 SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
 CARRIER_TOKEN = st.secrets.get("CARRIER_TOKEN") or os.environ.get("CARRIER_TOKEN")
 CARRIER_API_URL = st.secrets.get("CARRIER_API_URL") or os.environ.get("CARRIER_API_URL")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("🔑 Database configuration missing! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
+    st.error("🔑 Missing SUPABASE_URL or SUPABASE_KEY in secrets.")
     st.stop()
 
-if not CARRIER_TOKEN or not CARRIER_API_URL:
-    st.warning("⚠️ CARRIER_TOKEN or CARRIER_API_URL is missing from secrets. API searches may fail.")
-
-# Pre-defined list of all 50 US States + DC
 ALL_US_STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS",
+    "KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY",
+    "NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC"
 ]
 
-# --- CACHED HIGH-PERFORMANCE RESOURCES ---
 @st.cache_resource
-def get_supabase_client(url: str, key: str) -> Client:
-    return create_client(url, key)
+def get_supabase() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @st.cache_resource
-def get_http_session() -> requests.Session:
-    """Reuses TCP/TLS connections for maximum API speed."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    })
-    return session
+def get_http() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    return s
 
-supabase = get_supabase_client(SUPABASE_URL, SUPABASE_KEY)
-http_session = get_http_session()
+supabase = get_supabase()
+http_session = get_http()
 
-# --- BACKEND DATABASE UTILITIES ---
+# --- BACKEND UTILITIES ---
 def log_activity(email, action, detail=""):
     try:
-        supabase.table("activity_logs").insert({
-            "email": email,
-            "action": action,
-            "detail": detail
-        }).execute()
+        supabase.table("activity_logs").insert({"email": email, "action": action, "detail": detail}).execute()
     except Exception:
-        pass  
+        pass
 
 def get_system_config():
-    """Fetches global config settings from database."""
-    config = {"throttle_delay_ms": 300.00, "override_global_speed": False}
+    config = {"throttle_delay_ms": 300.0, "override_global_speed": False}
     try:
         res = supabase.table("system_config").select("*").execute()
-        for row in res.data:
-            if row["key"] == "throttle_delay_ms":
-                config["throttle_delay_ms"] = float(row["value"])
-            elif row["key"] == "override_global_speed":
-                config["override_global_speed"] = row["value"].upper() == "TRUE"
-    except Exception as e:
-        print(f"Error fetching system config: {e}")
+        for r in res.data:
+            if r["key"] == "throttle_delay_ms": config["throttle_delay_ms"] = float(r["value"])
+            elif r["key"] == "override_global_speed": config["override_global_speed"] = str(r["value"]).upper() == "TRUE"
+    except Exception:
+        pass
     return config
 
 def update_global_config(delay_ms, override_bool):
-    """Saves global settings to database."""
     try:
-        supabase.table("system_config").upsert(
-            {"key": "throttle_delay_ms", "value": f"{delay_ms:.4f}"},
-            on_conflict="key"
-        ).execute()
-        supabase.table("system_config").upsert(
-            {"key": "override_global_speed", "value": str(override_bool).upper()},
-            on_conflict="key"
-        ).execute()
+        supabase.table("system_config").upsert({"key": "throttle_delay_ms", "value": f"{delay_ms:.4f}"}, on_conflict="key").execute()
+        supabase.table("system_config").upsert({"key": "override_global_speed", "value": str(override_bool).upper()}, on_conflict="key").execute()
         return True
     except Exception as e:
-        st.error(f"Database error saving global speed config: {e}")
+        st.error(f"Config error: {e}")
         return False
 
 def get_user_settings(email):
-    """Fetches custom speed and custom auto-lock duration assigned to user."""
     try:
         res = supabase.table("users").select("delay_ms, session_duration_hours").eq("email", email).execute()
         if res.data:
-            delay = float(res.data[0].get("delay_ms", 300.00))
-            duration = float(res.data[0].get("session_duration_hours", 3.0))
-            return delay, duration
-    except Exception as e:
-        print(f"Error fetching user settings: {e}")
-    return 300.00, 3.0
+            return float(res.data[0].get("delay_ms", 300.0)), float(res.data[0].get("session_duration_hours", 3.0))
+    except Exception:
+        pass
+    return 300.0, 3.0
 
-# --- ADAPTIVE CARRIER API UTILITIES WITH EXPONENTIAL BACKOFF ---
-def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=3):
-    params = {
-        "type": "mc",
-        "value": str(mc_number).strip(),
-        "token": token
-    }
-
+# --- API & ENHANCED ENTITY PARSING ---
+def get_carrier_info(mc_number, token, retries=3):
+    params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     for attempt in range(retries + 1):
         try:
-            response = http_session.get(api_url, params=params, timeout=4.5)
-            if response.status_code == 200:
-                data = response.json()
+            res = http_session.get(CARRIER_API_URL, params=params, timeout=4.0)
+            if res.status_code == 200:
+                data = res.json()
                 if isinstance(data, dict) and ("carrier" in data or "error" in data):
                     return data
-            elif response.status_code == 429:
-                time.sleep(1.5 * (attempt + 1))
+            elif res.status_code == 429:
+                time.sleep(1.2 * (attempt + 1))
                 continue
         except requests.exceptions.RequestException:
             pass
-
-        if attempt < retries:
-            time.sleep(0.4 * (attempt + 1))
-
+        if attempt < retries: time.sleep(0.3 * (attempt + 1))
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
     if raw_data == "API_ERROR":
-        return {
-            "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "⚠️ API THROTTLED (RETRY NEEDED)",
-            "Entity Type": "N/A",
-            "Operating Status": "⚠️ UNKNOWN",
-            "Phone Number": "N/A",
-            "Email Address": "N/A",
-            "Location": "N/A"
-        }
+        return {"MC Number": f"MC-{mc_number}", "Carrier Name": "⚠️ API THROTTLED", "Entity Type": "N/A", "Operating Status": "⚠️ UNKNOWN", "Phone Number": "N/A", "Email Address": "N/A", "Location": "N/A"}
 
     if not raw_data or not isinstance(raw_data, dict) or "carrier" not in raw_data or not raw_data["carrier"]:
-        return {
-            "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "DOCKET NOT FOUND / DEAD NUMBER",
-            "Entity Type": "N/A",
-            "Operating Status": "❌ INVALID",
-            "Phone Number": "N/A",
-            "Email Address": "N/A",
-            "Location": "N/A"
-        }
-    
+        return {"MC Number": f"MC-{mc_number}", "Carrier Name": "DOCKET NOT FOUND", "Entity Type": "N/A", "Operating Status": "❌ INVALID", "Phone Number": "N/A", "Email Address": "N/A", "Location": "N/A"}
+
     c = raw_data.get("carrier", {})
+    name = str(c.get("dba_name") or c.get("legal_name") or "N/A").upper()
+    raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or "").upper()
     
     status_code = str(c.get("status_code", "")).upper()
-    allowed_to_operate = str(c.get("allowed_to_operate", "")).upper()
+    allowed_op = str(c.get("allowed_to_operate", "")).upper()
     common_auth = str(c.get("common_authority_status", "")).upper()
     contract_auth = str(c.get("contract_authority_status", "")).upper()
     broker_auth = str(c.get("broker_authority_status", "")).upper()
-    
-    raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or "").upper()
-    
-    # Accurate Entity Type Detection (Carrier vs Broker)
-    is_broker = "BROKER" in raw_entity or "ACTIVE" in broker_auth or broker_auth == "A"
-    is_carrier = "CARRIER" in raw_entity or "ACTIVE" in common_auth or "ACTIVE" in contract_auth or common_auth == "A" or contract_auth == "A"
-    
-    if is_broker and is_carrier:
-        entity_label = "CARRIER / BROKER"
-    elif is_broker:
-        entity_label = "BROKER"
-    elif is_carrier:
-        entity_label = "CARRIER"
-    elif raw_entity:
-        entity_label = raw_entity
-    else:
-        entity_label = "CARRIER"
 
-    is_active = (
-        status_code == "A" 
-        or allowed_to_operate == "Y" 
-        or "ACTIVE" in common_auth 
-        or "ACTIVE" in contract_auth
-        or "ACTIVE" in broker_auth
-    )
-    
-    if is_active:
-        status = "🟢 ACTIVE"
-    elif status_code:
-        status = f"🔴 INACTIVE ({status_code})"
-    else:
-        status = "🔴 INACTIVE"
-    
-    phone = str(c.get("phone") or c.get("cell_phone") or "N/A")
-    
-    email = c.get("email_address")
-    if not email or str(email).strip() == "":
-        email = "Not Listed"
-    else:
-        email = str(email).strip()
-    
+    # Robust Broker vs Carrier Detection
+    valid_auth = ["A", "Y", "ACTIVE", "AUTHORIZED", "GRANTED"]
+    is_broker = ("BROKER" in raw_entity or broker_auth in valid_auth or "LOGISTICS" in name or "BROKERAGE" in name)
+    is_carrier = ("CARRIER" in raw_entity or common_auth in valid_auth or contract_auth in valid_auth or allowed_op == "Y" or status_code == "A")
+
+    if is_broker and is_carrier: entity_label = "CARRIER / BROKER"
+    elif is_broker: entity_label = "BROKER"
+    elif is_carrier: entity_label = "CARRIER"
+    else: entity_label = "CARRIER"
+
+    is_active = (status_code == "A" or allowed_op == "Y" or any(a in valid_auth for a in [common_auth, contract_auth, broker_auth]))
+    status = "🟢 ACTIVE" if is_active else (f"🔴 INACTIVE ({status_code})" if status_code else "🔴 INACTIVE")
+
+    email = str(c.get("email_address") or "").strip()
+    email_val = email if email and email != "None" else "Not Listed"
+
     city = str(c.get("phy_city", "") or "").strip()
     state = str(c.get("phy_state", "") or "").strip()
     location = f"{city}, {state}".strip(", ") if city or state else "N/A"
-    
+
     return {
         "MC Number": f"MC-{mc_number}",
-        "Carrier Name": str(c.get("dba_name") or c.get("legal_name") or "N/A"),
+        "Carrier Name": name,
         "Entity Type": entity_label,
         "Operating Status": status,
-        "Phone Number": phone,
-        "Email Address": email,
+        "Phone Number": str(c.get("phone") or c.get("cell_phone") or "N/A"),
+        "Email Address": email_val,
         "Location": location
     }
 
-# --- STATE INITIALIZATIONS ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "current_user" not in st.session_state:
-    st.session_state.current_user = None
-if "session_token" not in st.session_state:
-    st.session_state.session_token = None
-if "is_admin" not in st.session_state:
-    st.session_state.is_admin = False
-if "login_time" not in st.session_state:
-    st.session_state.login_time = None
-if "start_mc_log" not in st.session_state:
-    st.session_state.start_mc_log = None
-if "last_mc_log" not in st.session_state:
-    st.session_state.last_mc_log = None
+# --- STATE INIT ---
+for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
+                 ("is_admin", False), ("login_time", None), ("running", False), 
+                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0)]:
+    if key not in st.session_state: st.session_state[key] = val
 
-# Smart Caching & Throttling Timers
-if "last_db_check" not in st.session_state:
-    st.session_state.last_db_check = 0.0
-if "last_session_check" not in st.session_state:
-    st.session_state.last_session_check = 0.0
-if "cached_delay_ms" not in st.session_state:
-    st.session_state.cached_delay_ms = 300.0
-if "cached_session_duration" not in st.session_state:
-    st.session_state.cached_session_duration = 3.0
-if "cached_speed_mode_string" not in st.session_state:
-    st.session_state.cached_speed_mode_string = "👤 300.00 ms"
-
-# --- AUTO-LOGOUT HELPER ---
-def force_logout(reason="Session Auto-Expired"):
+def force_logout(reason="Session Expired"):
     if st.session_state.authenticated and st.session_state.current_user:
-        if st.session_state.start_mc_log and st.session_state.last_mc_log:
-            log_activity(
-                st.session_state.current_user, 
-                "search_batch", 
-                f"Searched MC-{st.session_state.start_mc_log} to MC-{st.session_state.last_mc_log}"
-            )
         log_activity(st.session_state.current_user, "logout", reason)
-        
-        try:
-            supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
-        except Exception:
-            pass
-
-    st.session_state.authenticated = False
-    st.session_state.current_user = None
-    st.session_state.session_token = None
-    st.session_state.is_admin = False
-    st.session_state.login_time = None
-    st.session_state.running = False
+        try: supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
+        except Exception: pass
+    for k in ["authenticated", "current_user", "session_token", "is_admin", "login_time", "running"]:
+        st.session_state[k] = False if isinstance(st.session_state[k], bool) else None
     st.session_state.scraped_rows = []
     st.session_state.current_mc = ""
-    st.session_state.start_mc_log = None
-    st.session_state.last_mc_log = None
-    st.session_state.last_db_check = 0.0
-    st.session_state.last_session_check = 0.0
 
-# --- THROTTLED SINGLE-SESSION CHECKER ---
 def verify_active_session():
-    """Validates session token in DB against local tab token (Throttled to every 30s)."""
     if st.session_state.authenticated and st.session_state.current_user:
         now = time.time()
-        if now - st.session_state.last_session_check < 30.0:
-            return True
+        if now - st.session_state.last_session_check < 30.0: return True
         st.session_state.last_session_check = now
-        
         try:
             res = supabase.table("users").select("active_session_id").eq("email", st.session_state.current_user).execute()
-            if res.data:
-                db_token = res.data[0].get("active_session_id")
-                if not db_token or db_token != st.session_state.session_token:
-                    return False
-        except Exception as e:
-            print(f"Session check error: {e}")
+            if res.data and res.data[0].get("active_session_id") != st.session_state.session_token:
+                return False
+        except Exception: pass
     return True
 
-# --- LOGIN GATEWAY ---
+# --- LOGIN GATE ---
 if not st.session_state.authenticated:
     st.title("🔒 Security Access Required")
-    st.write(
-        "This engine is locked. Enter your assigned email and password to begin. "
-        "To get access please contact **my176business@gmail.com** or WhatsApp at **+923097503520**"
-    )
-    
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
-        email_input = st.text_input("Email Address:", placeholder="user@domain.com").strip().lower()
-    with col_l2:
-        password_input = st.text_input("Password:", type="password", placeholder="••••••••")
-        
+    st.write("Enter credentials. Contact **my176business@gmail.com** or WhatsApp **+923097503520**")
+    c1, c2 = st.columns(2)
+    email_in = c1.text_input("Email:").strip().lower()
+    pass_in = c2.text_input("Password:", type="password")
     if st.button("Verify & Unlock Engine", use_container_width=True):
-        response = supabase.table("users").select("*").eq("email", email_input).execute()
-        user_records = response.data
-        
-        if user_records and user_records[0]["password"] == password_input:
-            unique_session_token = str(uuid.uuid4())
-            supabase.table("users").update({"active_session_id": unique_session_token}).eq("email", email_input).execute()
-
-            st.session_state.scraped_rows = []
-            st.session_state.current_mc = ""  
-            st.session_state.running = False
-            st.session_state.start_mc_log = None
-            st.session_state.last_mc_log = None
-            
-            st.session_state.authenticated = True
-            st.session_state.current_user = email_input
-            st.session_state.session_token = unique_session_token
-            st.session_state.is_admin = user_records[0].get("is_admin", False)
-            st.session_state.login_time = time.time()
-            st.session_state.last_db_check = 0.0  
-            st.session_state.last_session_check = time.time()
-            
-            log_activity(email_input, "login", "Logged in successfully")
-            st.success(f"Access Granted! Welcome, {email_input}.")
+        res = supabase.table("users").select("*").eq("email", email_in).execute()
+        if res.data and res.data[0]["password"] == pass_in:
+            token = str(uuid.uuid4())
+            supabase.table("users").update({"active_session_id": token}).eq("email", email_in).execute()
+            st.session_state.update({"authenticated": True, "current_user": email_in, "session_token": token,
+                                     "is_admin": res.data[0].get("is_admin", False), "login_time": time.time(),
+                                     "scraped_rows": [], "current_mc": ""})
+            log_activity(email_in, "login", "Success")
             st.rerun()
-        else:
-            st.error("Access denied: Invalid credentials.")
+        else: st.error("Access denied.")
     st.stop()
 
-# --- MULTI-TAB & CONCURRENCY ENFORCEMENT ---
 if not verify_active_session():
-    st.error("⚠️ Account Session Kicked: You logged in from another tab, browser, or device.")
+    st.error("⚠️ Logged in from another tab or device.")
     st.session_state.authenticated = False
-    st.session_state.current_user = None
-    st.session_state.session_token = None
-    time.sleep(2)
+    time.sleep(1.5)
     st.rerun()
 
-# --- THROTTLED CONFIG RETRIEVAL (30s Interval) ---
+# --- SPEED CONFIG & AUTO-LOCK ---
 now = time.time()
 if now - st.session_state.last_db_check > 30.0:
-    sys_cfg = get_system_config()
-    if sys_cfg["override_global_speed"]:
-        st.session_state.cached_delay_ms = sys_cfg["throttle_delay_ms"]
-        st.session_state.cached_speed_mode_string = f"🚨 Forced Global Override ({st.session_state.cached_delay_ms:.2f} ms)"
-        _, st.session_state.cached_session_duration = get_user_settings(st.session_state.current_user)
+    cfg = get_system_config()
+    if cfg["override_global_speed"]:
+        st.session_state.cached_delay_ms = cfg["throttle_delay_ms"]
+        st.session_state.cached_speed_str = f"🚨 Forced Override ({cfg['throttle_delay_ms']:.2f} ms)"
+        _, st.session_state.cached_dur = get_user_settings(st.session_state.current_user)
     else:
-        st.session_state.cached_delay_ms, st.session_state.cached_session_duration = get_user_settings(st.session_state.current_user)
-        st.session_state.cached_speed_mode_string = f"👤 {st.session_state.cached_delay_ms:.2f} ms"
+        st.session_state.cached_delay_ms, st.session_state.cached_dur = get_user_settings(st.session_state.current_user)
+        st.session_state.cached_speed_str = f"👤 {st.session_state.cached_delay_ms:.2f} ms"
     st.session_state.last_db_check = now
 
-current_delay_ms = st.session_state.cached_delay_ms
-live_session_duration = st.session_state.cached_session_duration
-speed_mode_string = st.session_state.cached_speed_mode_string
+delay_ms = st.session_state.get("cached_delay_ms", 300.0)
+session_dur = st.session_state.get("cached_dur", 3.0)
+speed_str = st.session_state.get("cached_speed_str", "300 ms")
 
-# --- AUTO-LOCK CHECK ---
-if st.session_state.login_time:
-    session_timeout_seconds = live_session_duration * 3600
-    elapsed_time = time.time() - st.session_state.login_time
-    if elapsed_time >= session_timeout_seconds:
-        force_logout("Session Auto-Expired")
-        st.warning("⏱️ Session Expired: Your custom session has ended. Please log in again.")
-        st.rerun()
+if st.session_state.login_time and (time.time() - st.session_state.login_time >= session_dur * 3600):
+    force_logout("Auto-Expired")
+    st.warning("⏱️ Session Expired.")
+    st.rerun()
 
-# --- SIDEBAR USER CARD & TIMER ---
-st.sidebar.markdown(f"### 👤 Logged In As:")
-st.sidebar.info(st.session_state.current_user)
-
-session_timeout_seconds = live_session_duration * 3600
-elapsed_time = time.time() - st.session_state.login_time
-remaining_seconds = max(0, int(session_timeout_seconds - elapsed_time))
-
-st.sidebar.markdown(f"### ⏱️ Session Security Lockout")
-timer_html = f"""
-<div style="font-family: monospace; font-size: 16px; font-weight: bold; color: #ff4b4b; background-color: #0e1117; padding: 10px; border-radius: 5px; text-align: center; border: 1px solid #30363d; margin-bottom: 10px;">
-    Auto-Locks In: <span id="clock">--h --m --s</span>
+# --- SIDEBAR ---
+st.sidebar.markdown(f"### 👤 Logged In As:\n`{st.session_state.current_user}`")
+rem_sec = max(0, int((session_dur * 3600) - (time.time() - st.session_state.login_time)))
+components.html(f"""
+<div style="font-family:monospace;font-size:15px;font-weight:bold;color:#ff4b4b;background:#0e1117;padding:8px;border-radius:5px;text-align:center;border:1px solid #30363d;">
+Auto-Locks In: <span id="clock">--</span>
 </div>
 <script>
-    let remaining = {remaining_seconds};
-    const clockSpan = document.getElementById('clock');
-    
-    function updateClock() {{
-        if (remaining <= 0) {{
-            clockSpan.textContent = "EXPIRED";
-            window.parent.location.reload();
-            return;
-        }}
-        
-        let hours = Math.floor(remaining / 3600);
-        let minutes = Math.floor((remaining % 3600) / 60);
-        let seconds = remaining % 60;
-        
-        hours = hours < 10 ? "0" + hours : hours;
-        minutes = minutes < 10 ? "0" + minutes : minutes;
-        seconds = seconds < 10 ? "0" + seconds : seconds;
-        
-        clockSpan.textContent = hours + "h " + minutes + "m " + seconds + "s";
-        remaining--;
+    let rem = {rem_sec};
+    function u(){{
+        if(rem<=0){{ location.reload(); return; }}
+        let h=Math.floor(rem/3600), m=Math.floor((rem%3600)/60), s=rem%60;
+        document.getElementById('clock').textContent = (h<10?'0'+h:h)+'h '+(m<10?'0'+m:m)+'m '+(s<10?'0'+s:s)+'s';
+        rem--;
     }}
-    
-    updateClock();
-    setInterval(updateClock, 1000);
-</script>
-"""
-with st.sidebar:
-    components.html(timer_html, height=65)
+    u(); setInterval(u, 1000);
+</script>""", height=55)
 
-if st.sidebar.button("🔓 Manual Log Out", use_container_width=True):
+if st.sidebar.button("🔓 Log Out", use_container_width=True):
     force_logout("Manual Logout")
     st.rerun()
 
-# --- ADMIN PANEL CHECK ---
-show_admin_panel = False
-if st.session_state.is_admin:
-    st.sidebar.markdown("---")
-    show_admin_panel = st.sidebar.checkbox("🛡️ Open Admin Dashboard", value=False)
+show_admin = st.sidebar.checkbox("🛡️ Admin Dashboard", value=False) if st.session_state.is_admin else False
 
-# --- ADMIN PANEL RENDERING ---
-if show_admin_panel and st.session_state.is_admin:
-    st.title("🛡️ Super Admin Control Dashboard")
-    adm_tab1, adm_tab2, adm_tab3 = st.tabs(["👥 User Account Management", "📊 30-Day Activity logs", "⚙️ System Configuration"])
-    
-    with adm_tab1:
-        st.subheader("Add Single User Account")
-        col_add1, col_add2, col_add3 = st.columns(3)
-        with col_add1:
-            new_email = st.text_input("New User Email:", placeholder="driver@company.com", key="n_email").strip().lower()
-        with col_add2:
-            new_pass = st.text_input("Set Password:", placeholder="StrongPass123!", key="n_pass")
-        with col_add3:
-            new_role = st.selectbox("Role Status:", ["Standard User", "Super Admin"], key="n_role")
-            
-        st.markdown("**User Settings:**")
-        col_add4, col_add5, col_add6, col_add7 = st.columns(4)
-        with col_add4:
-            new_delay = st.number_input("Custom Speed (ms):", min_value=0.01, max_value=2000.0, value=300.0, step=0.01, format="%.2f", key="n_delay")
-        with col_add5:
-            new_hrs = st.number_input("Session Hours:", min_value=0, max_value=24, value=3, step=1, key="n_hrs")
-        with col_add6:
-            new_mins = st.number_input("Session Minutes:", min_value=0, max_value=59, value=0, step=1, key="n_mins")
-        with col_add7:
-            new_secs = st.number_input("Session Seconds:", min_value=0, max_value=59, value=0, step=1, key="n_secs")
-            
-        if st.button("➕ Register Single User Account", use_container_width=True):
-            if new_email and new_pass:
-                try:
-                    existing_user = supabase.table("users").select("email").eq("email", new_email).execute().data
-                    if existing_user:
-                        st.error(f"User with email '{new_email}' already exists!")
-                    else:
-                        role_bool = True if new_role == "Super Admin" else False
-                        total_hours_decimal = float(new_hrs) + (float(new_mins) / 60.0) + (float(new_secs) / 3600.0)
-                        
-                        if total_hours_decimal <= 0.0:
-                            st.error("Session lockout duration must be greater than 0 seconds.")
-                        else:
-                            supabase.table("users").insert({
-                                "email": new_email,
-                                "password": new_pass,
-                                "is_admin": role_bool,
-                                "delay_ms": float(new_delay),
-                                "session_duration_hours": total_hours_decimal
-                            }).execute()
-                            
-                            log_activity(st.session_state.current_user, "add_user", f"Added user: {new_email}")
-                            st.success(f"Successfully registered single account for {new_email}!")
-                            time.sleep(1)
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Error registering user: {str(e)}")
-            else:
-                st.warning("Email and Password fields cannot be empty.")
-                
-        st.markdown("---")
-        st.subheader("Existing Authorized Users")
-        user_list = supabase.table("users").select("*").execute().data
-        if user_list:
-            user_df = pd.DataFrame(user_list)
-            
-            def convert_hours_to_hms_str(h_decimal):
-                td = timedelta(hours=float(h_decimal))
-                tot_sec = int(td.total_seconds())
-                h = tot_sec // 3600
-                m = (tot_sec % 3600) // 60
-                s = tot_sec % 60
-                return f"{h}h {m}m {s}s"
-            
-            user_df["Readable Timeout"] = user_df["session_duration_hours"].apply(convert_hours_to_hms_str)
-            display_cols = ["email", "is_admin", "delay_ms", "Readable Timeout"]
-            st.dataframe(user_df[[c for c in display_cols if c in user_df.columns]], use_container_width=True)
-            
-            st.subheader("⚙️ Edit User Limits & Safety Guidelines")
-            col_mod1, col_mod2 = st.columns([2, 1])
-            with col_mod1:
-                target_mod_email = st.selectbox("Choose account to modify parameters:", [u["email"] for u in user_list])
-                
-            current_user_delay = next((u.get("delay_ms", 300.0) for u in user_list if u["email"] == target_mod_email), 300.0)
-            current_user_lock = next((u.get("session_duration_hours", 3.0) for u in user_list if u["email"] == target_mod_email), 3.0)
-            
-            tot_sec_cur = int(float(current_user_lock) * 3600)
-            cur_hrs = tot_sec_cur // 3600
-            cur_mins = (tot_sec_cur % 3600) // 60
-            cur_secs = tot_sec_cur % 60
-            
-            with col_mod2:
-                new_user_delay = st.number_input(
-                    "Update Speed Limit (ms):", 
-                    min_value=0.01, 
-                    max_value=2000.0, 
-                    value=float(current_user_delay), 
-                    step=0.1, 
-                    format="%.2f",
-                    key="edit_speed_user"
-                )
-                
-            st.markdown("**Update Timeout Value:**")
-            col_u1, col_u2, col_u3 = st.columns(3)
-            with col_u1:
-                edit_hrs = st.number_input("Hours:", min_value=0, max_value=24, value=cur_hrs, step=1, key="e_hrs")
-            with col_u2:
-                edit_mins = st.number_input("Minutes:", min_value=0, max_value=59, value=cur_mins, step=1, key="e_mins")
-            with col_u3:
-                edit_secs = st.number_input("Seconds:", min_value=0, max_value=59, value=cur_secs, step=1, key="e_secs")
-                
-            if st.button("⚡ Apply Updates for Selected Account", use_container_width=True):
-                try:
-                    total_edit_hours_decimal = float(edit_hrs) + (float(edit_mins) / 60.0) + (float(edit_secs) / 3600.0)
-                    if total_edit_hours_decimal <= 0.0:
-                        st.error("Session limit must be greater than 0 seconds.")
-                    else:
-                        supabase.table("users").update({
-                            "delay_ms": float(new_user_delay),
-                            "session_duration_hours": total_edit_hours_decimal
-                        }).eq("email", target_mod_email).execute()
-                        
-                        st.success(f"Successfully configured {target_mod_email}!")
-                        st.session_state.last_db_check = 0.0
-                        time.sleep(1)
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to update database: {e}")
-                    
-            st.markdown("---")
-            st.subheader("Terminate User Account")
-            del_email = st.selectbox("Select account to delete:", [u["email"] for u in user_list if u["email"] != st.session_state.current_user])
-            if st.button("🗑️ Delete Selected Account", type="primary"):
-                supabase.table("users").delete().eq("email", del_email).execute()
-                st.success(f"Terminated access for {del_email}.")
-                time.sleep(1)
-                st.rerun()
-
-    with adm_tab2:
-        st.subheader("User Activity Analytics (Last 30 Days)")
-        thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
-        logs = supabase.table("activity_logs").select("*").gte("created_at", thirty_days_ago).order("created_at", desc=True).execute().data
-        
-        if logs:
-            logs_df = pd.DataFrame(logs)
-            logs_df["Time & Date"] = pd.to_datetime(logs_df["created_at"]).dt.strftime('%Y-%m-%d %I:%M:%S %p')
-            
-            col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
-            col_kpi1.metric("Total Login/Logout Actions", len(logs_df[logs_df["action"].isin(["login", "logout"])]))
-            col_kpi2.metric("Total Batch Search Events", len(logs_df[logs_df["action"] == "search_batch"]))
-            col_kpi3.metric("Active Working Users", logs_df["email"].nunique())
-            
-            st.subheader("Leaderboard: Active Team Members")
-            leaderboard = logs_df[logs_df["action"] == "search_batch"].groupby("email").size().reset_index(name="Sequences Run")
-            st.dataframe(leaderboard.sort_values(by="Sequences Run", ascending=False), use_container_width=True)
-            
-            st.subheader("Raw History Streams")
-            clean_logs_show = logs_df[["Time & Date", "email", "action", "detail"]].rename(columns={
-                "email": "Email Address",
-                "action": "Action Taken",
-                "detail": "Action Details"
-            })
-            st.dataframe(clean_logs_show, use_container_width=True)
-        else:
-            st.info("No system activity logs found in the last 30 days.")
-
-    with adm_tab3:
-        st.subheader("Global Scraper Speed Configuration")
-        sys_config = get_system_config()
-        
-        override_switch = st.checkbox(
-            "⚠️ Activate Global Speed Override (Ignores individual user delays)", 
-            value=sys_config["override_global_speed"]
-        )
-        
-        global_speed_slider = st.number_input(
-            "Default Global Speed Limit (ms):", 
-            min_value=0.01, 
-            max_value=2000.0, 
-            value=float(sys_config["throttle_delay_ms"]), 
-            step=0.1, 
-            format="%.2f"
-        )
-        
-        st.info(f"Equivalent Override Value: **{global_speed_slider / 1000.0:.5f} seconds** per request.")
-        
-        if st.button("💾 Save Global Settings", use_container_width=True):
-            if update_global_config(float(global_speed_slider), override_switch):
-                st.success("Successfully updated system configurations!")
-                st.session_state.last_db_check = 0.0
-                time.sleep(1)
-                st.rerun()
+# --- ADMIN PANEL ---
+if show_admin and st.session_state.is_admin:
+    st.title("🛡️ Admin Dashboard")
+    t1, t2, t3 = st.tabs(["👥 Users", "📊 Logs", "⚙️ Config"])
+    with t1:
+        u_email = st.text_input("New Email:").strip().lower()
+        u_pass = st.text_input("New Pass:")
+        u_role = st.selectbox("Role:", ["Standard User", "Super Admin"])
+        u_delay = st.number_input("Speed (ms):", value=300.0)
+        u_hrs = st.number_input("Session Hours:", value=3)
+        if st.button("➕ Add User") and u_email and u_pass:
+            supabase.table("users").insert({"email": u_email, "password": u_pass, "is_admin": (u_role=="Super Admin"), "delay_ms": u_delay, "session_duration_hours": u_hrs}).execute()
+            st.success("User added!")
+            st.rerun()
+        st.dataframe(pd.DataFrame(supabase.table("users").select("email, is_admin, delay_ms, session_duration_hours").execute().data), use_container_width=True)
+    with t2:
+        logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(100).execute().data
+        if logs: st.dataframe(pd.DataFrame(logs), use_container_width=True)
+    with t3:
+        cfg = get_system_config()
+        over = st.checkbox("Global Speed Override", value=cfg["override_global_speed"])
+        g_speed = st.number_input("Global Speed (ms):", value=cfg["throttle_delay_ms"])
+        if st.button("💾 Save Global Config"):
+            update_global_config(g_speed, over)
+            st.success("Updated!")
+            st.rerun()
 
 # --- MAIN HARVESTER ENGINE ---
-if not show_admin_panel:
+if not show_admin:
     st.title("🚚 Automated Carrier Harvester")
-    st.write("Sequential tracking engine powered by CarrierChk. Enter a starting MC number to run live validation cycles.")
-    
-    st.sidebar.header("🛡️ API Connection Status")
-    if CARRIER_TOKEN and CARRIER_API_URL:
-        st.sidebar.success("CarrierChk API Active")
-    else:
-        st.sidebar.warning("Carrier Secrets Missing")
+    st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
 
-    if "running" not in st.session_state:
-        st.session_state.running = False
-    if "current_mc" not in st.session_state or st.session_state.current_mc == "":
-        st.session_state.current_mc = ""  
-    if "scraped_rows" not in st.session_state:
-        st.session_state.scraped_rows = []
-
-    col_in1, col_in2 = st.columns(2)
-    with col_in1:
+    c1, c2 = st.columns(2)
+    with c1:
         if st.session_state.current_mc == "":
-            raw_mc_input = st.text_input("Enter Starting MC Number to Begin:", value="", placeholder="e.g., 1066434")
-            if raw_mc_input.isdigit():
-                st.session_state.current_mc = int(raw_mc_input)
+            raw_mc = st.text_input("Starting MC Number:", placeholder="e.g. 1066434")
+            if raw_mc.isdigit(): st.session_state.current_mc = int(raw_mc)
         else:
-            st.session_state.current_mc = st.number_input("Set Starting MC Number:", min_value=1, value=int(st.session_state.current_mc), step=1)
-            
-    with col_in2:
-        st.metric("Enforced Speed Limit for Your Session", speed_mode_string)
+            st.session_state.current_mc = st.number_input("Set MC Number:", min_value=1, value=int(st.session_state.current_mc), step=1)
+    with c2:
+        st.metric("Session Speed Enforced", speed_str)
 
-    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
-    if col_btn1.button("🚀 Start Sequence", use_container_width=True):
-        if st.session_state.current_mc == "":
-            st.error("Please enter a starting MC Number before running the automation sequence.")
-        else:
+    b1, b2, b3, b4 = st.columns(4)
+    if b1.button("🚀 Start Sequence", use_container_width=True):
+        if st.session_state.current_mc != "":
             st.session_state.running = True
-            st.session_state.start_mc_log = int(st.session_state.current_mc)
-            st.session_state.last_mc_log = int(st.session_state.current_mc)
             st.rerun()
+        else: st.error("Enter MC Number first.")
 
-    if col_btn2.button("🛑 STOP Sequence", use_container_width=True):
+    if b2.button("🛑 STOP Sequence", use_container_width=True):
         st.session_state.running = False
-        if st.session_state.start_mc_log is not None and st.session_state.last_mc_log is not None:
-            log_activity(
-                st.session_state.current_user, 
-                "search_batch", 
-                f"Searched MC-{st.session_state.start_mc_log} to MC-{st.session_state.last_mc_log}"
-            )
-            st.session_state.start_mc_log = None
-            st.session_state.last_mc_log = None
-            
-        st.success(f"Automation paused cleanly at MC-{st.session_state.current_mc}")
+        st.success("Paused sequence.")
 
-    if col_btn3.button("♻️ Retry Throttled Rows", use_container_width=True):
-        throttled_indexes = [
-            i for i, r in enumerate(st.session_state.scraped_rows) 
-            if "THROTTLED" in str(r.get("Carrier Name", ""))
-        ]
-        if throttled_indexes:
-            status_box_retry = st.empty()
-            st.info(f"Retrying {len(throttled_indexes)} throttled rows...")
-            for idx in throttled_indexes:
-                raw_mc_clean = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
-                status_box_retry.info(f"🔄 Re-fetching MC-{raw_mc_clean}...")
-                raw_info = get_carrier_info(raw_mc_clean, CARRIER_TOKEN)
-                st.session_state.scraped_rows[idx] = parse_carrier_data(raw_mc_clean, raw_info)
-                time.sleep(0.35)
-            st.success("Throttled rows successfully resolved!")
-            st.rerun()
-        else:
-            st.info("No throttled rows found to retry.")
+    if b3.button("♻️ Retry Throttled", use_container_width=True):
+        for idx, row in enumerate(st.session_state.scraped_rows):
+            if "THROTTLED" in str(row.get("Carrier Name", "")):
+                mc_c = str(row["MC Number"]).replace("MC-", "").strip()
+                st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
+        st.rerun()
 
-    if col_btn4.button("🗑️ Clear Data", use_container_width=True):
+    if b4.button("🗑️ Clear Data", use_container_width=True):
         st.session_state.scraped_rows = []
-        st.success("Internal data sheet cleared.")
         st.rerun()
 
-    # --- HIGH-SPEED BATCH AUTOMATION ENGINE LOOP WITH ADAPTIVE PACING ---
+    # --- SCRAPING LOOP ---
     if st.session_state.running and st.session_state.current_mc != "":
-        status_box = st.empty()
-        
-        BATCH_SIZE = 5
-        safety_delay_seconds = max(0.30, current_delay_ms / 1000.0)
-        
-        for _ in range(BATCH_SIZE):
-            if not st.session_state.running:
-                break
-                
-            target_mc = str(st.session_state.current_mc)
-            status_box.info(f"⚡ Live Scraping Active | Processing Target: **MC-{target_mc}**...")
+        st_box = st.empty()
+        for _ in range(5):
+            if not st.session_state.running: break
+            target = str(st.session_state.current_mc)
+            st_box.info(f"⚡ Live Scraping | Target: **MC-{target}**...")
             
-            st.session_state.last_mc_log = int(st.session_state.current_mc)
-            
-            raw_info = get_carrier_info(target_mc, CARRIER_TOKEN)
-            parsed_row = parse_carrier_data(target_mc, raw_info)
-            
-            st.session_state.scraped_rows.append(parsed_row)
+            raw_info = get_carrier_info(target, CARRIER_TOKEN)
+            st.session_state.scraped_rows.append(parse_carrier_data(target, raw_info))
             st.session_state.current_mc += 1
-            
-            time.sleep(safety_delay_seconds)
-                
+            time.sleep(max(0.25, delay_ms / 1000.0))
         st.rerun()
 
-    # --- TABBED DISPLAY, FILTERING & EXPORT ---
+    # --- FILTERING & DISPLAY ---
     st.markdown("---")
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
 
-        # Safeguard: ensure essential columns exist and are safely converted to string
-        if "Entity Type" not in base_df.columns:
-            base_df["Entity Type"] = "CARRIER"
+        # Ensure text types and handle NaNs safely
+        for col in ["Entity Type", "Operating Status", "Carrier Name", "MC Number", "Location", "Email Address"]:
+            if col not in base_df.columns: base_df[col] = "N/A"
+            base_df[col] = base_df[col].fillna("N/A").astype(str)
 
-        base_df["Entity Type"] = base_df["Entity Type"].fillna("CARRIER").astype(str)
-        base_df["Operating Status"] = base_df["Operating Status"].fillna("N/A").astype(str)
-        base_df["Carrier Name"] = base_df["Carrier Name"].fillna("N/A").astype(str)
-        base_df["MC Number"] = base_df["MC Number"].fillna("N/A").astype(str)
-        base_df["Location"] = base_df["Location"].fillna("N/A").astype(str)
-        base_df["Email Address"] = base_df["Email Address"].fillna("N/A").astype(str)
-
-        # --- DYNAMIC DATA FILTERING SECTION ---
         with st.expander("🔍 Filter Collected Records", expanded=True):
-            col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+            f1, f2, f3, f4 = st.columns(4)
+            sq = f1.text_input("🔎 Search Name / MC:", value="").strip().lower()
             
-            with col_f1:
-                search_query = st.text_input("🔎 Search Name or MC:", value="", placeholder="e.g. LOGISTICS or 1800016")
-                
-            with col_f2:
-                raw_entities = [str(e) for e in base_df["Entity Type"].unique() if str(e) not in ["N/A", "nan", "None", ""]]
-                all_entities = ["ALL"] + sorted(list(set(raw_entities)))
-                selected_entity = st.selectbox("🚛 Filter Entity Type:", all_entities)
+            raw_ent = [e for e in base_df["Entity Type"].unique() if e not in ["N/A", "nan", "None", ""]]
+            sel_ent = f2.selectbox("🚛 Filter Entity Type:", ["ALL"] + sorted(list(set(raw_ent))))
 
-            with col_f3:
-                raw_statuses = [str(s) for s in base_df["Operating Status"].unique() if str(s) not in ["N/A", "nan", "None", ""]]
-                all_statuses = ["ALL"] + sorted(list(set(raw_statuses)))
-                selected_status = st.selectbox("📌 Filter Status:", all_statuses)
-                
-            with col_f4:
-                extracted_states = set()
-                for loc in base_df["Location"]:
-                    loc_str = str(loc)
-                    if "," in loc_str:
-                        st_code = loc_str.split(",")[-1].strip().upper()
-                        if st_code and len(st_code) == 2:
-                            extracted_states.add(st_code)
+            raw_stat = [s for s in base_df["Operating Status"].unique() if s not in ["N/A", "nan", "None", ""]]
+            sel_stat = f3.selectbox("📌 Filter Status:", ["ALL"] + sorted(list(set(raw_stat))))
 
-                all_states_set = set(ALL_US_STATES).union(extracted_states)
-                all_states = ["ALL"] + sorted(list(all_states_set))
-                selected_state = st.selectbox("📍 Filter State:", all_states)
+            states = set(ALL_US_STATES)
+            for loc in base_df["Location"]:
+                if "," in loc:
+                    st_code = loc.split(",")[-1].strip().upper()
+                    if len(st_code) == 2: states.add(st_code)
+            sel_state = f4.selectbox("📍 Filter State:", ["ALL"] + sorted(list(states)))
 
-        # Apply Filters to Create Filtered DataFrame
         filtered_df = base_df.copy()
-
-        if search_query.strip():
-            sq = search_query.strip().lower()
-            filtered_df = filtered_df[
-                filtered_df["Carrier Name"].str.lower().str.contains(sq, na=False) |
-                filtered_df["MC Number"].str.lower().str.contains(sq, na=False)
-            ]
-
-        if selected_entity != "ALL":
-            filtered_df = filtered_df[filtered_df["Entity Type"] == selected_entity]
-
-        if selected_status != "ALL":
-            filtered_df = filtered_df[filtered_df["Operating Status"] == selected_status]
-
-        if selected_state != "ALL":
-            filtered_df = filtered_df[filtered_df["Location"].str.endswith(selected_state, na=False)]
+        if sq:
+            filtered_df = filtered_df[filtered_df["Carrier Name"].str.lower().str.contains(sq) | filtered_df["MC Number"].str.lower().str.contains(sq)]
+        if sel_ent != "ALL":
+            filtered_df = filtered_df[filtered_df["Entity Type"] == sel_ent]
+        if sel_stat != "ALL":
+            filtered_df = filtered_df[filtered_df["Operating Status"] == sel_stat]
+        if sel_state != "ALL":
+            filtered_df = filtered_df[filtered_df["Location"].str.endswith(sel_state)]
 
         st.caption(f"Showing **{len(filtered_df)}** of **{len(base_df)}** total harvested records.")
 
         tab1, tab2, tab3 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Active Only)", "📧 Raw Active Email List"])
         
         with tab1:
-            st.subheader("Master History Sheet (Filtered Results)")
             st.dataframe(filtered_df, use_container_width=True)
-            
-            master_csv = filtered_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Export Master Sheet to CSV",
-                data=master_csv,
-                file_name="Master_MC_Harvest_Log.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="master_download"
-            )
-            
+            st.download_button("📥 Export Master Sheet to CSV", filtered_df.to_csv(index=False).encode('utf-8'), "Master_MC_Log.csv", "text/csv", use_container_width=True)
+
         with tab2:
-            st.subheader("Clean Target Pitch Sheet (ACTIVE Carriers Only)")
             leads_df = filtered_df[
-                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
-                (filtered_df["Email Address"] != "N/A") & 
-                (filtered_df["Email Address"] != "Not Listed") & 
-                (filtered_df["Email Address"].str.contains("@", na=False))
+                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE")) & 
+                (filtered_df["Email Address"].str.contains("@", na=False)) &
+                (~filtered_df["Email Address"].isin(["N/A", "Not Listed"]))
             ]
-            
             if not leads_df.empty:
-                st.success(f"Found {len(leads_df)} active targets matching your filter criteria!")
                 st.dataframe(leads_df, use_container_width=True)
-                
-                leads_csv = leads_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Export Clean Active Email Pitch Sheet to CSV",
-                    data=leads_csv,
-                    file_name="Active_Carrier_Emails.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="leads_download"
-                )
+                st.download_button("📥 Export Clean Active Leads to CSV", leads_df.to_csv(index=False).encode('utf-8'), "Active_Leads.csv", "text/csv", use_container_width=True)
             else:
-                st.info("No active leads with email addresses match your current filters.")
+                st.info("No active leads matching current filters.")
 
         with tab3:
-            st.subheader("Isolated Email Blast Column (ACTIVE Carriers Only)")
-            valid_emails = filtered_df[
-                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
-                (filtered_df["Email Address"] != "N/A") & 
-                (filtered_df["Email Address"] != "Not Listed") & 
-                (filtered_df["Email Address"].str.contains("@", na=False))
+            emails = filtered_df[
+                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE")) & 
+                (filtered_df["Email Address"].str.contains("@", na=False)) &
+                (~filtered_df["Email Address"].isin(["N/A", "Not Listed"]))
             ]["Email Address"].drop_duplicates()
-            
-            if not valid_emails.empty:
-                just_emails_df = pd.DataFrame({"Email Address": valid_emails})
-                
-                st.success(f"Found {len(just_emails_df)} unique emails from ACTIVE records matching your filters!")
-                st.dataframe(just_emails_df, use_container_width=True)
-                
-                email_text = "\n".join(just_emails_df["Email Address"].tolist())
-                st.text_area("Copy Raw Active Emails:", value=email_text, height=150)
-                
-                raw_emails_csv = just_emails_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Export Isolated Active Email List to CSV",
-                    data=raw_emails_csv,
-                    file_name="Active_Mailing_List.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="raw_emails_download"
-                )
+            if not emails.empty:
+                edf = pd.DataFrame({"Email Address": emails})
+                st.dataframe(edf, use_container_width=True)
+                st.text_area("Copy Emails:", value="\n".join(emails.tolist()), height=140)
+                st.download_button("📥 Export Emails CSV", edf.to_csv(index=False).encode('utf-8'), "Active_Emails.csv", "text/csv", use_container_width=True)
             else:
-                st.info("No active carrier emails match your current filters.")
+                st.info("No active emails matching current filters.")
     else:
-        st.info("No data rows collected in this run yet. Click 'Start Sequence' to begin harvesting.")
+        st.info("No records collected yet. Click 'Start Sequence' to begin harvesting.")
