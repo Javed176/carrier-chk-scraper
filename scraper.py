@@ -14,14 +14,23 @@ st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
 CARRIER_TOKEN = st.secrets.get("CARRIER_TOKEN") or os.environ.get("CARRIER_TOKEN")
-CARRIER_API_URL = st.secrets.get("CARRIER_API_URL") or os.environ.get("CARRIER_API_URL") or "https://carrierchk.com/api/carrier"
+CARRIER_API_URL = st.secrets.get("CARRIER_API_URL") or os.environ.get("CARRIER_API_URL")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("🔑 Database configuration missing! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
     st.stop()
 
-if not CARRIER_TOKEN:
-    st.warning("⚠️ CARRIER_TOKEN is missing from secrets. API searches may fail.")
+if not CARRIER_TOKEN or not CARRIER_API_URL:
+    st.warning("⚠️ CARRIER_TOKEN or CARRIER_API_URL is missing from secrets. API searches may fail.")
+
+# Pre-defined list of all 50 US States + DC
+ALL_US_STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"
+]
 
 # --- CACHED HIGH-PERFORMANCE RESOURCES ---
 @st.cache_resource
@@ -605,10 +614,10 @@ if not show_admin_panel:
     st.write("Sequential tracking engine powered by CarrierChk. Enter a starting MC number to run live validation cycles.")
     
     st.sidebar.header("🛡️ API Connection Status")
-    if CARRIER_TOKEN:
+    if CARRIER_TOKEN and CARRIER_API_URL:
         st.sidebar.success("CarrierChk API Active")
     else:
-        st.sidebar.warning("Carrier Token Missing")
+        st.sidebar.warning("Carrier Secrets Missing")
 
     if "running" not in st.session_state:
         st.session_state.running = False
@@ -730,8 +739,12 @@ if not show_admin_panel:
                 extracted_states = set()
                 for loc in base_df["Location"].dropna():
                     if "," in loc:
-                        extracted_states.add(loc.split(",")[-1].strip())
-                all_states = ["ALL"] + sorted(list(extracted_states))
+                        extracted_states.add(loc.split(",")[-1].strip().upper())
+                
+                # Full list of all 50 US States + DC + any extras extracted dynamically
+                all_states_combined = set(ALL_US_STATES).union(extracted_states)
+                all_states = ["ALL"] + sorted(list(all_states_combined))
+                
                 selected_state = st.selectbox("📍 Filter State:", all_states)
 
         # Apply Filters to Create Filtered DataFrame
