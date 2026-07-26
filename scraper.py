@@ -174,7 +174,15 @@ def parse_carrier_data(mc_number, raw_data):
         }
 
     raw_entity = str(
-        c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or c.get("operation_classification") or ""
+        c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or ""
+    ).strip().upper()
+
+    op_class = str(
+        c.get("operation_classification") or c.get("carrier_operation") or c.get("operationClass") or c.get("operation_class") or ""
+    ).strip().upper()
+
+    direct_badge = str(
+        c.get("badge") or c.get("entity_badge") or c.get("classification") or c.get("badge_type") or ""
     ).strip().upper()
 
     def is_strictly_active(val):
@@ -186,9 +194,9 @@ def parse_carrier_data(mc_number, raw_data):
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
-    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
-    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
+    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or c.get("common_status")
+    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
+    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status")
 
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
@@ -215,30 +223,23 @@ def parse_carrier_data(mc_number, raw_data):
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
-    direct_badge = str(c.get("badge") or c.get("entity_badge") or c.get("classification") or "").strip().upper()
-    
-    if "BROKER" in direct_badge and "CARRIER" not in direct_badge:
+
+    # --- ENTITY TYPE CLASSIFICATION LOGIC ---
+    is_carrier_auth = has_common_active or has_contract_active or ("AUTHORIZED FOR HIRE" in op_class) or ("CARRIER" in direct_badge)
+    is_broker_auth = has_broker_active or ("BROKER" in direct_badge)
+
+    if is_broker_auth and is_carrier_auth:
+        entity_label = "CARRIER / BROKER"
+    elif is_carrier_auth:
+        entity_label = "CARRIER"
+    elif is_broker_auth:
         entity_label = "BROKER"
-    elif "CARRIER" in direct_badge and "BROKER" not in direct_badge:
+    elif "BROKER" in raw_entity or "FORWARDER" in raw_entity or "BROKER" in name:
+        entity_label = "BROKER"
+    elif "CARRIER" in raw_entity or "MOTOR" in raw_entity or (pu_count is not None and pu_count > 0):
         entity_label = "CARRIER"
     else:
-        is_carrier_auth = has_common_active or has_contract_active
-        is_broker_auth = has_broker_active
-
-        if not is_carrier_auth and not is_broker_auth:
-            if "BROKER" in raw_entity or "FORWARDER" in raw_entity or "BROKER" in name:
-                is_broker_auth = True
-            if "CARRIER" in raw_entity or "MOTOR" in raw_entity or (pu_count is not None and pu_count > 0):
-                is_carrier_auth = True
-
-        if is_broker_auth and is_carrier_auth:
-            entity_label = "CARRIER / BROKER"
-        elif is_broker_auth or (pu_count == 0 and not is_carrier_auth):
-            entity_label = "BROKER"
-        elif is_carrier_auth or (pu_count is not None and pu_count > 0):
-            entity_label = "CARRIER"
-        else:
-            entity_label = "BROKER" if ("BROKER" in name or "LOGISTICS" in name) else "CARRIER"
+        entity_label = "BROKER" if ("BROKER" in name or "LOGISTICS" in name or "FREIGHT" in name) else "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
@@ -563,7 +564,6 @@ if not show_admin:
                     total_scraped = len(st.session_state.scraped_rows)
                     start_idx = max(0, total_scraped - target_limit)
 
-                    # PERSISTENT MULTI-PASS RETRY LOOP (Up to 3 passes with increasing backoff)
                     max_retry_passes = 3
                     for pass_num in range(1, max_retry_passes + 1):
                         batch_slice = st.session_state.scraped_rows[start_idx:]
@@ -574,7 +574,7 @@ if not show_admin:
                         ]
 
                         if not throttled_indices:
-                            break  # All throttled items resolved!
+                            break
 
                         cool_down = 4.0 * pass_num
                         st_box.warning(
@@ -608,19 +608,16 @@ if not show_admin:
                     st_box.info(f"🛑 Batch complete! Continuing next batch starting from MC-{st.session_state.current_mc}...")
                     time.sleep(1.5)
 
-                # LOG BATCH ACTIVITY TO DATABASE
                 log_activity(
                     st.session_state.current_user,
                     "search_batch",
                     f"Searched MC-{start_mc_batch} to MC-{end_mc_batch}"
                 )
 
-                # RESET COUNTER & AUTO-CONTINUE NEXT BATCH
                 st.session_state.batch_progress = 0
                 st.rerun()
                 break
 
-            # Circuit breaker delay if current request returned throttle warning
             if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
                 st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 4.0s...")
                 time.sleep(4.0)
