@@ -23,7 +23,23 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 if not CARRIER_TOKEN:
     st.warning("⚠️ CARRIER_TOKEN is missing from secrets. API searches may fail.")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# --- CACHED HIGH-PERFORMANCE RESOURCES ---
+@st.cache_resource
+def get_supabase_client(url: str, key: str) -> Client:
+    return create_client(url, key)
+
+@st.cache_resource
+def get_http_session() -> requests.Session:
+    """Reuses TCP/TLS connections for maximum API scraping speed."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    })
+    return session
+
+supabase = get_supabase_client(SUPABASE_URL, SUPABASE_KEY)
+http_session = get_http_session()
 
 # --- BACKEND DATABASE UTILITIES ---
 def log_activity(email, action, detail=""):
@@ -78,41 +94,29 @@ def get_user_settings(email):
         print(f"Error fetching user settings: {e}")
     return 250.00, 3.0
 
-# --- CARRIER API UTILITIES WITH ROBUST RETRIES ---
-def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=6):
-    url = api_url
+# --- FAST CARRIER API UTILITIES ---
+def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=2):
     params = {
         "type": "mc",
         "value": str(mc_number).strip(),
         "token": token
     }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
 
-    for attempt in range(retries):
+    for attempt in range(retries + 1):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=(5.0, 10.0))
+            response = http_session.get(api_url, params=params, timeout=3.5)
             if response.status_code == 200:
                 data = response.json()
                 if isinstance(data, dict) and ("carrier" in data or "error" in data):
                     return data
             elif response.status_code == 429:
-                time.sleep(2.0 * (attempt + 1))
+                time.sleep(0.3 * (attempt + 1))
                 continue
-            
-            time.sleep(1.0 * (attempt + 1))
         except requests.exceptions.RequestException:
-            time.sleep(1.5 * (attempt + 1))
+            pass
 
-    try:
-        time.sleep(3.0)
-        final_resp = requests.get(url, params=params, headers=headers, timeout=10.0)
-        if final_resp.status_code == 200:
-            return final_resp.json()
-    except Exception:
-        pass
+        if attempt < retries:
+            time.sleep(0.2)
 
     return "API_ERROR"
 
@@ -193,9 +197,11 @@ if "start_mc_log" not in st.session_state:
 if "last_mc_log" not in st.session_state:
     st.session_state.last_mc_log = None
 
-# Smart Caching Layers
+# Smart Caching & Throttling Timers
 if "last_db_check" not in st.session_state:
     st.session_state.last_db_check = 0.0
+if "last_session_check" not in st.session_state:
+    st.session_state.last_session_check = 0.0
 if "cached_delay_ms" not in st.session_state:
     st.session_state.cached_delay_ms = 250.0
 if "cached_session_duration" not in st.session_state:
@@ -214,7 +220,6 @@ def force_logout(reason="Session Auto-Expired"):
             )
         log_activity(st.session_state.current_user, "logout", reason)
         
-        # Clear active session token from DB on exit
         try:
             supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
         except Exception:
@@ -231,16 +236,21 @@ def force_logout(reason="Session Auto-Expired"):
     st.session_state.start_mc_log = None
     st.session_state.last_mc_log = None
     st.session_state.last_db_check = 0.0
+    st.session_state.last_session_check = 0.0
 
-# --- STRICT SINGLE-SESSION CHECKER ---
+# --- THROTTLED SINGLE-SESSION CHECKER ---
 def verify_active_session():
-    """Validates session token in DB against local tab token."""
+    """Validates session token in DB against local tab token (Throttled to every 30s for performance)."""
     if st.session_state.authenticated and st.session_state.current_user:
+        now = time.time()
+        if now - st.session_state.last_session_check < 30.0:
+            return True
+        st.session_state.last_session_check = now
+        
         try:
             res = supabase.table("users").select("active_session_id").eq("email", st.session_state.current_user).execute()
             if res.data:
                 db_token = res.data[0].get("active_session_id")
-                # Token mismatch = logged in from another tab or device
                 if not db_token or db_token != st.session_state.session_token:
                     return False
         except Exception as e:
@@ -266,10 +276,7 @@ if not st.session_state.authenticated:
         user_records = response.data
         
         if user_records and user_records[0]["password"] == password_input:
-            # Generate Unique Session ID for this login
             unique_session_token = str(uuid.uuid4())
-            
-            # Update DB with new session token (invalidates any older active tabs)
             supabase.table("users").update({"active_session_id": unique_session_token}).eq("email", email_input).execute()
 
             st.session_state.scraped_rows = []
@@ -284,6 +291,7 @@ if not st.session_state.authenticated:
             st.session_state.is_admin = user_records[0].get("is_admin", False)
             st.session_state.login_time = time.time()
             st.session_state.last_db_check = 0.0  
+            st.session_state.last_session_check = time.time()
             
             log_activity(email_input, "login", "Logged in successfully")
             st.success(f"Access Granted! Welcome, {email_input}.")
@@ -301,9 +309,9 @@ if not verify_active_session():
     time.sleep(2)
     st.rerun()
 
-# --- THROTTLED CONFIG RETRIEVAL ---
+# --- THROTTLED CONFIG RETRIEVAL (30s Interval) ---
 now = time.time()
-if now - st.session_state.last_db_check > 10.0:
+if now - st.session_state.last_db_check > 30.0:
     sys_cfg = get_system_config()
     if sys_cfg["override_global_speed"]:
         st.session_state.cached_delay_ms = sys_cfg["throttle_delay_ms"]
@@ -312,7 +320,7 @@ if now - st.session_state.last_db_check > 10.0:
     else:
         st.session_state.cached_delay_ms, st.session_state.cached_session_duration = get_user_settings(st.session_state.current_user)
         st.session_state.cached_speed_mode_string = f"👤 {st.session_state.cached_delay_ms:.2f} ms"
-        st.session_state.last_db_check = now
+    st.session_state.last_db_check = now
 
 current_delay_ms = st.session_state.cached_delay_ms
 live_session_duration = st.session_state.cached_session_duration
@@ -627,23 +635,32 @@ if not show_admin_panel:
         st.success("Internal data sheet cleared.")
         st.rerun()
 
-    # --- AUTOMATION ENGINE LOOP ---
+    # --- HIGH-SPEED BATCH AUTOMATION ENGINE LOOP ---
     if st.session_state.running and st.session_state.current_mc != "":
-        target_mc = str(st.session_state.current_mc)
-        
         status_box = st.empty()
-        status_box.info(f"Processing target line item: **MC-{target_mc}**...")
         
-        st.session_state.last_mc_log = int(st.session_state.current_mc)
+        # Process up to 5 MC numbers per execution cycle to minimize Streamlit rerun overhead
+        BATCH_SIZE = 5
+        safety_delay_seconds = max(0.05, current_delay_ms / 1000.0)
         
-        raw_info = get_carrier_info(target_mc, CARRIER_TOKEN)
-        parsed_row = parse_carrier_data(target_mc, raw_info)
-        
-        st.session_state.scraped_rows.append(parsed_row)
-        
-        st.session_state.current_mc += 1
-        safety_delay_seconds = max(0.35, current_delay_ms / 1000.0)
-        time.sleep(safety_delay_seconds)
+        for _ in range(BATCH_SIZE):
+            if not st.session_state.running:
+                break
+                
+            target_mc = str(st.session_state.current_mc)
+            status_box.info(f"⚡ High-Speed Scraping Active | Processing Target: **MC-{target_mc}**...")
+            
+            st.session_state.last_mc_log = int(st.session_state.current_mc)
+            
+            raw_info = get_carrier_info(target_mc, CARRIER_TOKEN)
+            parsed_row = parse_carrier_data(target_mc, raw_info)
+            
+            st.session_state.scraped_rows.append(parsed_row)
+            st.session_state.current_mc += 1
+            
+            if safety_delay_seconds > 0:
+                time.sleep(safety_delay_seconds)
+                
         st.rerun()
 
     # --- TABBED DISPLAY & EXPORT ---
