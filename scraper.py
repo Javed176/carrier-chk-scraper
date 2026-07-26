@@ -131,7 +131,7 @@ def parse_carrier_data(mc_number, raw_data):
 
     # Extract Raw Entity Type
     raw_entity = str(
-        c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or ""
+        c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or c.get("operation_classification") or ""
     ).strip().upper()
 
     # Helper function to check explicit active authority status values
@@ -140,22 +140,28 @@ def parse_carrier_data(mc_number, raw_data):
         v = str(val).strip().upper()
         if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DISMISS", "DENIED", "N"]):
             return False
-        return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED"])
-
-    # Core Status Flags
-    allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
-    status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
+        return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
     # Authority Field Checks
-    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
-    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
+    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or c.get("common_status")
+    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
+    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status")
 
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
 
-    # 1. STATUS DETERMINATION
+    # Power Units Check
+    power_units_raw = c.get("power_units") if c.get("power_units") is not None else c.get("powerUnits")
+    try:
+        pu_count = int(power_units_raw)
+    except (ValueError, TypeError):
+        pu_count = None
+
+    # Status Determination
+    allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
+    status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
+
     is_active = (
         allowed_op in ["Y", "YES", "TRUE"] or
         status_field in ["A", "ACTIVE", "AUTHORIZED"] or
@@ -164,19 +170,21 @@ def parse_carrier_data(mc_number, raw_data):
         has_broker_active
     )
 
-    # Explicit override: If status is inactive/revoked and no authorities are active, lock to INACTIVE
+    # Override: Inactive status without active authority values
     if (status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE"] or allowed_op in ["N", "NO"]) and not (has_common_active or has_contract_active or has_broker_active):
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # 2. ENTITY TYPE DETERMINATION
-    is_broker = ("BROKER" in raw_entity or "FREIGHT FORWARDER" in raw_entity or has_broker_active)
-    is_carrier = ("CARRIER" in raw_entity or has_common_active or has_contract_active or allowed_op in ["Y", "YES"])
+    # Entity Type Determination
+    is_broker = (has_broker_active or "BROKER" in raw_entity or "FORWARDER" in raw_entity)
+    is_carrier = (has_common_active or has_contract_active or ("CARRIER" in raw_entity and "BROKER" not in raw_entity))
 
-    # Special handling: If marked as BROKER without active motor carrier authority, enforce BROKER
-    if "BROKER" in raw_entity and not (has_common_active or has_contract_active):
+    # Zero fleet size rule: If fleet is 0 and no motor carrier authority, enforce BROKER
+    if pu_count == 0 and not (has_common_active or has_contract_active):
         is_carrier = False
+        if is_broker or "LOGISTICS" in name or "BROKER" in name or "FREIGHT" in name:
+            is_broker = True
 
     if is_broker and is_carrier:
         entity_label = "CARRIER / BROKER"
@@ -184,12 +192,13 @@ def parse_carrier_data(mc_number, raw_data):
         entity_label = "BROKER"
     elif is_carrier:
         entity_label = "CARRIER"
-    elif raw_entity:
-        entity_label = raw_entity
     else:
-        entity_label = "CARRIER"
+        if "BROKER" in raw_entity or "LOGISTICS" in name or "BROKER" in name:
+            entity_label = "BROKER"
+        else:
+            entity_label = "CARRIER"
 
-    # 3. CONTACT & LOCATION
+    # Contact & Location
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
@@ -221,7 +230,7 @@ def force_logout(reason="Session Expired"):
         log_activity(st.session_state.current_user, "logout", reason)
         try: supabase.table("users").update({"active_session_id": None}).eq("email", st.session_state.current_user).execute()
         except Exception: pass
-    for k in ["authenticated", "current_user", "session_token", "is_admin", "login_time", "running"]:
+    for k in ["authenticated", "current_user", "session_token", "is_admin", "running"]:
         st.session_state[k] = False if isinstance(st.session_state[k], bool) else None
     st.session_state.scraped_rows = []
     st.session_state.current_mc = ""
