@@ -30,7 +30,7 @@ def get_supabase_client(url: str, key: str) -> Client:
 
 @st.cache_resource
 def get_http_session() -> requests.Session:
-    """Reuses TCP/TLS connections for maximum API scraping speed."""
+    """Reuses TCP/TLS connections for maximum API speed."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -54,7 +54,7 @@ def log_activity(email, action, detail=""):
 
 def get_system_config():
     """Fetches global config settings from database."""
-    config = {"throttle_delay_ms": 250.00, "override_global_speed": False}
+    config = {"throttle_delay_ms": 300.00, "override_global_speed": False}
     try:
         res = supabase.table("system_config").select("*").execute()
         for row in res.data:
@@ -87,15 +87,15 @@ def get_user_settings(email):
     try:
         res = supabase.table("users").select("delay_ms, session_duration_hours").eq("email", email).execute()
         if res.data:
-            delay = float(res.data[0].get("delay_ms", 250.00))
+            delay = float(res.data[0].get("delay_ms", 300.00))
             duration = float(res.data[0].get("session_duration_hours", 3.0))
             return delay, duration
     except Exception as e:
         print(f"Error fetching user settings: {e}")
-    return 250.00, 3.0
+    return 300.00, 3.0
 
-# --- FAST CARRIER API UTILITIES ---
-def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=2):
+# --- ADAPTIVE CARRIER API UTILITIES WITH EXPONENTIAL BACKOFF ---
+def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=3):
     params = {
         "type": "mc",
         "value": str(mc_number).strip(),
@@ -104,19 +104,20 @@ def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=2):
 
     for attempt in range(retries + 1):
         try:
-            response = http_session.get(api_url, params=params, timeout=3.5)
+            response = http_session.get(api_url, params=params, timeout=4.5)
             if response.status_code == 200:
                 data = response.json()
                 if isinstance(data, dict) and ("carrier" in data or "error" in data):
                     return data
             elif response.status_code == 429:
-                time.sleep(0.3 * (attempt + 1))
+                # Dynamic backoff pause when server rate limit is triggered
+                time.sleep(1.5 * (attempt + 1))
                 continue
         except requests.exceptions.RequestException:
             pass
 
         if attempt < retries:
-            time.sleep(0.2)
+            time.sleep(0.4 * (attempt + 1))
 
     return "API_ERROR"
 
@@ -203,11 +204,11 @@ if "last_db_check" not in st.session_state:
 if "last_session_check" not in st.session_state:
     st.session_state.last_session_check = 0.0
 if "cached_delay_ms" not in st.session_state:
-    st.session_state.cached_delay_ms = 250.0
+    st.session_state.cached_delay_ms = 300.0
 if "cached_session_duration" not in st.session_state:
     st.session_state.cached_session_duration = 3.0
 if "cached_speed_mode_string" not in st.session_state:
-    st.session_state.cached_speed_mode_string = "👤 250.00 ms"
+    st.session_state.cached_speed_mode_string = "👤 300.00 ms"
 
 # --- AUTO-LOGOUT HELPER ---
 def force_logout(reason="Session Auto-Expired"):
@@ -240,7 +241,7 @@ def force_logout(reason="Session Auto-Expired"):
 
 # --- THROTTLED SINGLE-SESSION CHECKER ---
 def verify_active_session():
-    """Validates session token in DB against local tab token (Throttled to every 30s for performance)."""
+    """Validates session token in DB against local tab token (Throttled to every 30s)."""
     if st.session_state.authenticated and st.session_state.current_user:
         now = time.time()
         if now - st.session_state.last_session_check < 30.0:
@@ -406,7 +407,7 @@ if show_admin_panel and st.session_state.is_admin:
         st.markdown("**User Settings:**")
         col_add4, col_add5, col_add6, col_add7 = st.columns(4)
         with col_add4:
-            new_delay = st.number_input("Custom Speed (ms):", min_value=0.01, max_value=2000.0, value=250.0, step=0.01, format="%.2f", key="n_delay")
+            new_delay = st.number_input("Custom Speed (ms):", min_value=0.01, max_value=2000.0, value=300.0, step=0.01, format="%.2f", key="n_delay")
         with col_add5:
             new_hrs = st.number_input("Session Hours:", min_value=0, max_value=24, value=3, step=1, key="n_hrs")
         with col_add6:
@@ -467,7 +468,7 @@ if show_admin_panel and st.session_state.is_admin:
             with col_mod1:
                 target_mod_email = st.selectbox("Choose account to modify parameters:", [u["email"] for u in user_list])
                 
-            current_user_delay = next((u.get("delay_ms", 250.0) for u in user_list if u["email"] == target_mod_email), 250.0)
+            current_user_delay = next((u.get("delay_ms", 300.0) for u in user_list if u["email"] == target_mod_email), 300.0)
             current_user_lock = next((u.get("session_duration_hours", 3.0) for u in user_list if u["email"] == target_mod_email), 3.0)
             
             tot_sec_cur = int(float(current_user_lock) * 3600)
@@ -607,7 +608,7 @@ if not show_admin_panel:
     with col_in2:
         st.metric("Enforced Speed Limit for Your Session", speed_mode_string)
 
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
     if col_btn1.button("🚀 Start Sequence", use_container_width=True):
         if st.session_state.current_mc == "":
             st.error("Please enter a starting MC Number before running the automation sequence.")
@@ -630,25 +631,45 @@ if not show_admin_panel:
             
         st.success(f"Automation paused cleanly at MC-{st.session_state.current_mc}")
 
-    if col_btn3.button("🗑️ Clear Collected Data", use_container_width=True):
+    # Re-try throttled records button
+    if col_btn3.button("♻️ Retry Throttled Rows", use_container_width=True):
+        throttled_indexes = [
+            i for i, r in enumerate(st.session_state.scraped_rows) 
+            if "THROTTLED" in r.get("Carrier Name", "")
+        ]
+        if throttled_indexes:
+            status_box_retry = st.empty()
+            st.info(f"Retrying {len(throttled_indexes)} throttled rows...")
+            for idx in throttled_indexes:
+                raw_mc_clean = st.session_state.scraped_rows[idx]["MC Number"].replace("MC-", "").strip()
+                status_box_retry.info(f"🔄 Re-fetching MC-{raw_mc_clean}...")
+                raw_info = get_carrier_info(raw_mc_clean, CARRIER_TOKEN)
+                st.session_state.scraped_rows[idx] = parse_carrier_data(raw_mc_clean, raw_info)
+                time.sleep(0.35)
+            st.success("Throttled rows successfully resolved!")
+            st.rerun()
+        else:
+            st.info("No throttled rows found to retry.")
+
+    if col_btn4.button("🗑️ Clear Data", use_container_width=True):
         st.session_state.scraped_rows = []
         st.success("Internal data sheet cleared.")
         st.rerun()
 
-    # --- HIGH-SPEED BATCH AUTOMATION ENGINE LOOP ---
+    # --- HIGH-SPEED BATCH AUTOMATION ENGINE LOOP WITH ADAPTIVE PACING ---
     if st.session_state.running and st.session_state.current_mc != "":
         status_box = st.empty()
         
-        # Process up to 5 MC numbers per execution cycle to minimize Streamlit rerun overhead
         BATCH_SIZE = 5
-        safety_delay_seconds = max(0.05, current_delay_ms / 1000.0)
+        # Enforce minimum safe delay floor of 300ms (0.3s) between calls to prevent 429 API rate limits
+        safety_delay_seconds = max(0.30, current_delay_ms / 1000.0)
         
         for _ in range(BATCH_SIZE):
             if not st.session_state.running:
                 break
                 
             target_mc = str(st.session_state.current_mc)
-            status_box.info(f"⚡ High-Speed Scraping Active | Processing Target: **MC-{target_mc}**...")
+            status_box.info(f"⚡ Live Scraping Active | Processing Target: **MC-{target_mc}**...")
             
             st.session_state.last_mc_log = int(st.session_state.current_mc)
             
@@ -658,8 +679,7 @@ if not show_admin_panel:
             st.session_state.scraped_rows.append(parsed_row)
             st.session_state.current_mc += 1
             
-            if safety_delay_seconds > 0:
-                time.sleep(safety_delay_seconds)
+            time.sleep(safety_delay_seconds)
                 
         st.rerun()
 
