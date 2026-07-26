@@ -71,7 +71,7 @@ def get_user_settings(email):
         pass
     return 300.0, 3.0
 
-# --- API & ENHANCED ENTITY PARSING ---
+# --- API & COMPREHENSIVE CARRIER/AUTHORITY PARSING ---
 def get_carrier_info(mc_number, token, retries=3):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     for attempt in range(retries + 1):
@@ -98,31 +98,53 @@ def parse_carrier_data(mc_number, raw_data):
 
     c = raw_data.get("carrier", {})
     name = str(c.get("dba_name") or c.get("legal_name") or "N/A").upper()
-    raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or "").upper()
+    raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or c.get("entityType") or "").upper()
     
-    status_code = str(c.get("status_code", "")).upper()
-    allowed_op = str(c.get("allowed_to_operate", "")).upper()
-    common_auth = str(c.get("common_authority_status", "")).upper()
-    contract_auth = str(c.get("contract_authority_status", "")).upper()
-    broker_auth = str(c.get("broker_authority_status", "")).upper()
+    status_code = str(c.get("status_code") or c.get("statusCode") or "").upper()
+    allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").upper()
+    
+    # Check all key variations (snake_case and camelCase)
+    common_auth = str(c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or "").upper()
+    contract_auth = str(c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or "").upper()
+    broker_auth = str(c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or "").upper()
 
-    valid_auth = ["A", "Y", "ACTIVE", "AUTHORIZED", "GRANTED"]
-    is_broker = ("BROKER" in raw_entity or broker_auth in valid_auth or "LOGISTICS" in name or "BROKERAGE" in name)
-    is_carrier = ("CARRIER" in raw_entity or common_auth in valid_auth or contract_auth in valid_auth or allowed_op == "Y" or status_code == "A")
+    def is_auth_active(auth_str):
+        if not auth_str: return False
+        return any(k in auth_str for k in ["ACTIVE", "AUTH", "GRANT", "YES"]) or auth_str in ["A", "Y"]
 
-    if is_broker and is_carrier: entity_label = "CARRIER / BROKER"
-    elif is_broker: entity_label = "BROKER"
-    elif is_carrier: entity_label = "CARRIER"
-    else: entity_label = "CARRIER"
+    has_common = is_auth_active(common_auth)
+    has_contract = is_auth_active(contract_auth)
+    has_broker = is_auth_active(broker_auth)
 
-    is_active = (status_code == "A" or allowed_op == "Y" or any(a in valid_auth for a in [common_auth, contract_auth, broker_auth]))
+    # Strictly authority-based entity classification (No company name matching)
+    is_broker_entity = ("BROKER" in raw_entity or has_broker)
+    is_carrier_entity = ("CARRIER" in raw_entity or has_common or has_contract or allowed_op == "Y")
+
+    if is_broker_entity and is_carrier_entity:
+        entity_label = "CARRIER / BROKER"
+    elif is_broker_entity:
+        entity_label = "BROKER"
+    elif is_carrier_entity:
+        entity_label = "CARRIER"
+    else:
+        entity_label = raw_entity if raw_entity else "CARRIER"
+
+    # Active status: True if allowed to operate OR status_code is A OR ANY authority is active
+    is_active = (
+        allowed_op == "Y" or 
+        status_code in ["A", "ACTIVE"] or 
+        has_common or 
+        has_contract or 
+        has_broker
+    )
+
     status = "🟢 ACTIVE" if is_active else (f"🔴 INACTIVE ({status_code})" if status_code else "🔴 INACTIVE")
 
-    email = str(c.get("email_address") or "").strip()
-    email_val = email if email and email != "None" else "Not Listed"
+    email = str(c.get("email_address") or c.get("email") or "").strip()
+    email_val = email if email and email.lower() not in ["none", "null", ""] else "Not Listed"
 
-    city = str(c.get("phy_city", "") or "").strip()
-    state = str(c.get("phy_state", "") or "").strip()
+    city = str(c.get("phy_city") or c.get("city") or "").strip()
+    state = str(c.get("phy_state") or c.get("state") or "").strip()
     location = f"{city}, {state}".strip(", ") if city or state else "N/A"
 
     return {
@@ -307,14 +329,10 @@ if show_admin and st.session_state.is_admin:
             logs_df = pd.DataFrame(logs)
             logs_df["Time & Date"] = pd.to_datetime(logs_df["created_at"]).dt.strftime('%Y-%m-%d %I:%M:%S %p')
             
-            # User History Filter Panel
             log_users = ["ALL Users"] + sorted([str(u) for u in logs_df["email"].unique() if u])
             selected_log_user = st.selectbox("🔍 Filter Activity History by User:", log_users)
             
-            if selected_log_user != "ALL Users":
-                display_logs = logs_df[logs_df["email"] == selected_log_user]
-            else:
-                display_logs = logs_df
+            display_logs = logs_df[logs_df["email"] == selected_log_user] if selected_log_user != "ALL Users" else logs_df
 
             st.caption(f"Showing **{len(display_logs)}** log records.")
             st.dataframe(display_logs[["Time & Date", "email", "action", "detail"]].rename(columns={
@@ -361,11 +379,10 @@ if not show_admin:
         st.session_state.running = False
         st.success("Paused sequence.")
 
-    if b3.button("♻️ Retry Throttled", use_container_width=True):
+    if b3.button("♻️ Retry Throttled / Inactive", use_container_width=True):
         for idx, row in enumerate(st.session_state.scraped_rows):
-            if "THROTTLED" in str(row.get("Carrier Name", "")):
-                mc_c = str(row["MC Number"]).replace("MC-", "").strip()
-                st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
+            mc_c = str(row["MC Number"]).replace("MC-", "").strip()
+            st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
         st.rerun()
 
     if b4.button("🗑️ Clear Data", use_container_width=True):
