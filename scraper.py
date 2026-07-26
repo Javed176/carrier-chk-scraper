@@ -106,7 +106,6 @@ def parse_carrier_data(mc_number, raw_data):
     contract_auth = str(c.get("contract_authority_status", "")).upper()
     broker_auth = str(c.get("broker_authority_status", "")).upper()
 
-    # Robust Broker vs Carrier Detection
     valid_auth = ["A", "Y", "ACTIVE", "AUTHORIZED", "GRANTED"]
     is_broker = ("BROKER" in raw_entity or broker_auth in valid_auth or "LOGISTICS" in name or "BROKERAGE" in name)
     is_carrier = ("CARRIER" in raw_entity or common_auth in valid_auth or contract_auth in valid_auth or allowed_op == "Y" or status_code == "A")
@@ -238,29 +237,102 @@ show_admin = st.sidebar.checkbox("🛡️ Admin Dashboard", value=False) if st.s
 
 # --- ADMIN PANEL ---
 if show_admin and st.session_state.is_admin:
-    st.title("🛡️ Admin Dashboard")
-    t1, t2, t3 = st.tabs(["👥 Users", "📊 Logs", "⚙️ Config"])
+    st.title("🛡️ Super Admin Control Dashboard")
+    t1, t2, t3 = st.tabs(["👥 User Management", "📊 Activity History Logs", "⚙️ System Configuration"])
+    
     with t1:
-        u_email = st.text_input("New Email:").strip().lower()
-        u_pass = st.text_input("New Pass:")
-        u_role = st.selectbox("Role:", ["Standard User", "Super Admin"])
-        u_delay = st.number_input("Speed (ms):", value=300.0)
-        u_hrs = st.number_input("Session Hours:", value=3)
-        if st.button("➕ Add User") and u_email and u_pass:
-            supabase.table("users").insert({"email": u_email, "password": u_pass, "is_admin": (u_role=="Super Admin"), "delay_ms": u_delay, "session_duration_hours": u_hrs}).execute()
-            st.success("User added!")
+        st.subheader("➕ Register New User")
+        col_a1, col_a2, col_a3 = st.columns(3)
+        u_email = col_a1.text_input("New Email:").strip().lower()
+        u_pass = col_a2.text_input("Set Password:")
+        u_role = col_a3.selectbox("Role:", ["Standard User", "Super Admin"])
+        
+        col_a4, col_a5 = st.columns(2)
+        u_delay = col_a4.number_input("Speed Limit (ms):", value=300.0, step=10.0)
+        u_hrs = col_a5.number_input("Session Timeout (Hours):", value=3.0, step=0.5)
+        
+        if st.button("➕ Add User Account", use_container_width=True) and u_email and u_pass:
+            supabase.table("users").insert({
+                "email": u_email, 
+                "password": u_pass, 
+                "is_admin": (u_role == "Super Admin"), 
+                "delay_ms": u_delay, 
+                "session_duration_hours": u_hrs
+            }).execute()
+            st.success(f"Registered new account for {u_email}!")
             st.rerun()
-        st.dataframe(pd.DataFrame(supabase.table("users").select("email, is_admin, delay_ms, session_duration_hours").execute().data), use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("✏️ Edit Account Settings & Passwords")
+        user_list = supabase.table("users").select("*").execute().data
+        
+        if user_list:
+            user_emails = [u["email"] for u in user_list]
+            target_email = st.selectbox("Choose Account to Modify:", user_emails)
+            target_user = next((u for u in user_list if u["email"] == target_email), None)
+            
+            if target_user:
+                col_e1, col_e2, col_e3 = st.columns(3)
+                e_pass = col_e1.text_input("Change Password:", value=str(target_user.get("password", "")))
+                e_hrs = col_e2.number_input("Session Lockout Timeout (Hours):", min_value=0.1, max_value=24.0, value=float(target_user.get("session_duration_hours", 3.0)), step=0.5)
+                e_delay = col_e3.number_input("Speed Limit (ms):", min_value=1.0, value=float(target_user.get("delay_ms", 300.0)), step=10.0)
+                
+                if st.button("💾 Apply Account Updates", use_container_width=True):
+                    supabase.table("users").update({
+                        "password": e_pass,
+                        "session_duration_hours": float(e_hrs),
+                        "delay_ms": float(e_delay)
+                    }).eq("email", target_email).execute()
+                    st.success(f"Successfully updated credentials and timeouts for {target_email}!")
+                    st.session_state.last_db_check = 0.0
+                    time.sleep(1)
+                    st.rerun()
+
+            st.markdown("---")
+            st.subheader("📋 Registered Users Overview")
+            st.dataframe(pd.DataFrame(user_list)[["email", "is_admin", "password", "delay_ms", "session_duration_hours"]], use_container_width=True)
+            
+            st.subheader("🗑️ Delete Account")
+            del_email = st.selectbox("Select Account to Delete:", [u for u in user_emails if u != st.session_state.current_user])
+            if st.button("Delete Account", type="primary"):
+                supabase.table("users").delete().eq("email", del_email).execute()
+                st.success(f"Deleted {del_email}.")
+                st.rerun()
+
     with t2:
-        logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(100).execute().data
-        if logs: st.dataframe(pd.DataFrame(logs), use_container_width=True)
+        st.subheader("📊 Target User Activity History")
+        logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(500).execute().data
+        
+        if logs:
+            logs_df = pd.DataFrame(logs)
+            logs_df["Time & Date"] = pd.to_datetime(logs_df["created_at"]).dt.strftime('%Y-%m-%d %I:%M:%S %p')
+            
+            # User History Filter Panel
+            log_users = ["ALL Users"] + sorted([str(u) for u in logs_df["email"].unique() if u])
+            selected_log_user = st.selectbox("🔍 Filter Activity History by User:", log_users)
+            
+            if selected_log_user != "ALL Users":
+                display_logs = logs_df[logs_df["email"] == selected_log_user]
+            else:
+                display_logs = logs_df
+
+            st.caption(f"Showing **{len(display_logs)}** log records.")
+            st.dataframe(display_logs[["Time & Date", "email", "action", "detail"]].rename(columns={
+                "email": "User Email",
+                "action": "Action",
+                "detail": "Details"
+            }), use_container_width=True)
+        else:
+            st.info("No activity logs found.")
+
     with t3:
+        st.subheader("⚙️ Global Speed Overrides")
         cfg = get_system_config()
-        over = st.checkbox("Global Speed Override", value=cfg["override_global_speed"])
-        g_speed = st.number_input("Global Speed (ms):", value=cfg["throttle_delay_ms"])
-        if st.button("💾 Save Global Config"):
+        over = st.checkbox("Global Speed Override (Applies to all users)", value=cfg["override_global_speed"])
+        g_speed = st.number_input("Global Delay (ms):", value=cfg["throttle_delay_ms"])
+        if st.button("💾 Save Global Settings"):
             update_global_config(g_speed, over)
-            st.success("Updated!")
+            st.success("Global configuration saved!")
             st.rerun()
 
 # --- MAIN HARVESTER ENGINE ---
@@ -319,7 +391,6 @@ if not show_admin:
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
 
-        # Ensure text types and handle NaNs safely
         for col in ["Entity Type", "Operating Status", "Carrier Name", "MC Number", "Location", "Email Address"]:
             if col not in base_df.columns: base_df[col] = "N/A"
             base_df[col] = base_df[col].fillna("N/A").astype(str)
