@@ -120,7 +120,7 @@ def parse_carrier_data(mc_number, raw_data):
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "INACTIVE / REVOKED DOCKET",
-            "Entity Type": "CARRIER",
+            "Entity Type": "N/A",
             "Operating Status": "🔴 INACTIVE",
             "Phone Number": "N/A",
             "Email Address": "N/A",
@@ -219,20 +219,28 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- PRECISE AUTHORITY & BADGE CLASSIFICATION ENGINE ---
+    # --- FLEXIBLE AUTHORITY & BROKER/CARRIER CLASSIFICATION ENGINE ---
+    is_broker_keyword = any(term in name for term in ["SHIPPING", "BROKER", "LOGISTICS", "3PL", "FREIGHT SOLUTIONS", "TRANSPORT SERVICES"])
     is_broker_badge = any(term in direct_badge or term in raw_entity or term in op_class or term in str(c).upper() for term in ["BROKER", "PROPERTY BROKER"])
-    is_carrier_badge = any(term in direct_badge or term in raw_entity or term in op_class for term in ["CARRIER", "COMMON CARRIER", "CONTRACT CARRIER"])
 
-    if is_broker_badge and not (has_common_active or has_contract_active):
-        entity_label = "BROKER"
-    elif (has_common_active or has_contract_active) and (has_broker_active or is_broker_badge):
-        entity_label = "CARRIER / BROKER"
-    elif has_common_active or has_contract_active:
+    is_carrier_keyword = any(term in name for term in ["TRANSPORT", "TRUCKING", "CARRIER", "FREIGHT", "LINES", "LOGISTIC", "EXPRESS"])
+    is_carrier_badge = any(term in direct_badge or term in raw_entity or term in op_class or term in str(c).upper() for term in ["CARRIER", "MOTOR", "COMMON", "CONTRACT"])
+
+    if has_broker_active or is_broker_badge or is_broker_keyword:
+        if has_common_active or has_contract_active or is_carrier_badge or is_carrier_keyword:
+            entity_label = "CARRIER / BROKER"
+        else:
+            entity_label = "BROKER"
+    elif has_common_active or has_contract_active or is_carrier_badge or is_carrier_keyword:
         entity_label = "CARRIER"
-    elif has_broker_active or is_broker_badge:
-        entity_label = "BROKER"
     else:
-        entity_label = "CARRIER"
+        # If no strict matches, evaluate based on API text or default safely
+        if "BROKER" in raw_entity:
+            entity_label = "BROKER"
+        elif "CARRIER" in raw_entity or "MOTOR" in raw_entity:
+            entity_label = "CARRIER"
+        else:
+            entity_label = "BROKER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
