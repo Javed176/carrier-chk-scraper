@@ -79,7 +79,7 @@ def get_carrier_info(mc_number, token, retries=3):
             res = http_session.get(CARRIER_API_URL, params=params, timeout=4.0)
             if res.status_code == 200:
                 data = res.json()
-                if isinstance(data, dict) and ("carrier" in data or "error" in data):
+                if isinstance(data, dict) and ("carrier" in data or "error" in data or "data" in data):
                     return data
             elif res.status_code == 429:
                 time.sleep(1.2 * (attempt + 1))
@@ -93,55 +93,61 @@ def parse_carrier_data(mc_number, raw_data):
     if raw_data == "API_ERROR":
         return {"MC Number": f"MC-{mc_number}", "Carrier Name": "⚠️ API THROTTLED", "Entity Type": "N/A", "Operating Status": "⚠️ UNKNOWN", "Phone Number": "N/A", "Email Address": "N/A", "Location": "N/A"}
 
-    if not raw_data or not isinstance(raw_data, dict) or "carrier" not in raw_data or not raw_data["carrier"]:
+    if not raw_data or not isinstance(raw_data, dict):
         return {"MC Number": f"MC-{mc_number}", "Carrier Name": "DOCKET NOT FOUND", "Entity Type": "N/A", "Operating Status": "❌ INVALID", "Phone Number": "N/A", "Email Address": "N/A", "Location": "N/A"}
 
-    c = raw_data.get("carrier", {})
-    name = str(c.get("dba_name") or c.get("legal_name") or "N/A").upper()
+    c = raw_data.get("carrier") or raw_data.get("data") or raw_data
+    if not isinstance(c, dict) or not c:
+        return {"MC Number": f"MC-{mc_number}", "Carrier Name": "DOCKET NOT FOUND", "Entity Type": "N/A", "Operating Status": "❌ INVALID", "Phone Number": "N/A", "Email Address": "N/A", "Location": "N/A"}
+
+    name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").upper()
+    if name in ["NONE", "NULL", ""]: name = "DOCKET NOT FOUND"
+
     raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or c.get("entityType") or "").upper()
-    
-    status_code = str(c.get("status_code") or c.get("statusCode") or "").upper()
-    allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").upper()
-    
-    # Check all key variations (snake_case and camelCase)
-    common_auth = str(c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or "").upper()
-    contract_auth = str(c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or "").upper()
-    broker_auth = str(c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or "").upper()
 
-    def is_auth_active(auth_str):
-        if not auth_str: return False
-        return any(k in auth_str for k in ["ACTIVE", "AUTH", "GRANT", "YES"]) or auth_str in ["A", "Y"]
+    # Flatten response dictionary into a searchable map
+    str_map = {str(k).lower(): str(v).upper() for k, v in c.items() if v is not None}
 
-    has_common = is_auth_active(common_auth)
-    has_contract = is_auth_active(contract_auth)
-    has_broker = is_auth_active(broker_auth)
+    def check_active_match(val_str):
+        v = str(val_str).upper().strip()
+        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE"]):
+            return False
+        return any(pos in v for pos in ["ACTIVE", "AUTHORIZED", "GRANTED"]) or v in ["A", "Y", "TRUE"]
 
-    # Strictly authority-based entity classification (No company name matching)
-    is_broker_entity = ("BROKER" in raw_entity or has_broker)
-    is_carrier_entity = ("CARRIER" in raw_entity or has_common or has_contract or allowed_op == "Y")
+    # Check primary operational indicators
+    allowed_op = str_map.get("allowed_to_operate", str_map.get("allowedtooperate", ""))
+    status_code = str_map.get("status_code", str_map.get("statuscode", str_map.get("status", "")))
 
-    if is_broker_entity and is_carrier_entity:
+    # Scan all key fields for active authority matches (Common, Contract, Broker, General Authority)
+    any_active_authority = False
+    for k, v in str_map.items():
+        if any(term in k for term in ["auth", "status", "operate", "active"]):
+            if check_active_match(v):
+                any_active_authority = True
+                break
+
+    # Determine Active Status
+    is_active = (allowed_op == "Y" or status_code in ["A", "ACTIVE", "AUTHORIZED"] or any_active_authority)
+    status = "🟢 ACTIVE" if is_active else (f"🔴 INACTIVE ({status_code})" if status_code else "🔴 INACTIVE")
+
+    # Entity classification strictly based on FMCSA authority values
+    has_broker_auth = any(check_active_match(v) for k, v in str_map.items() if "broker" in k)
+    has_carrier_auth = any(check_active_match(v) for k, v in str_map.items() if "common" in k or "contract" in k) or allowed_op == "Y"
+
+    is_broker = ("BROKER" in raw_entity or has_broker_auth)
+    is_carrier = ("CARRIER" in raw_entity or has_carrier_auth)
+
+    if is_broker and is_carrier:
         entity_label = "CARRIER / BROKER"
-    elif is_broker_entity:
+    elif is_broker:
         entity_label = "BROKER"
-    elif is_carrier_entity:
+    elif is_carrier:
         entity_label = "CARRIER"
     else:
         entity_label = raw_entity if raw_entity else "CARRIER"
 
-    # Active status: True if allowed to operate OR status_code is A OR ANY authority is active
-    is_active = (
-        allowed_op == "Y" or 
-        status_code in ["A", "ACTIVE"] or 
-        has_common or 
-        has_contract or 
-        has_broker
-    )
-
-    status = "🟢 ACTIVE" if is_active else (f"🔴 INACTIVE ({status_code})" if status_code else "🔴 INACTIVE")
-
     email = str(c.get("email_address") or c.get("email") or "").strip()
-    email_val = email if email and email.lower() not in ["none", "null", ""] else "Not Listed"
+    email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else "Not Listed"
 
     city = str(c.get("phy_city") or c.get("city") or "").strip()
     state = str(c.get("phy_state") or c.get("state") or "").strip()
@@ -379,10 +385,23 @@ if not show_admin:
         st.session_state.running = False
         st.success("Paused sequence.")
 
-    if b3.button("♻️ Retry Throttled / Inactive", use_container_width=True):
+    # Targeted retry loop for throttled or failed rows only
+    if b3.button("♻️ Retry Throttled", use_container_width=True):
+        retried_count = 0
         for idx, row in enumerate(st.session_state.scraped_rows):
-            mc_c = str(row["MC Number"]).replace("MC-", "").strip()
-            st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
+            c_name = str(row.get("Carrier Name", "")).upper()
+            op_stat = str(row.get("Operating Status", "")).upper()
+            
+            if "THROTTLED" in c_name or "UNKNOWN" in op_stat or "API_ERROR" in c_name:
+                mc_c = str(row["MC Number"]).replace("MC-", "").strip()
+                st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
+                retried_count += 1
+                time.sleep(0.3)
+                
+        if retried_count > 0:
+            st.success(f"Retried {retried_count} throttled record(s)!")
+        else:
+            st.info("No throttled records to retry.")
         st.rerun()
 
     if b4.button("🗑️ Clear Data", use_container_width=True):
