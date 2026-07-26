@@ -499,7 +499,17 @@ if not show_admin:
         else: st.error("Enter MC Number first.")
 
     if b2.button("🛑 STOP Sequence", use_container_width=True):
+        if st.session_state.running and st.session_state.batch_progress > 0:
+            start_mc_batch = int(st.session_state.current_mc) - int(st.session_state.batch_progress)
+            end_mc_batch = int(st.session_state.current_mc) - 1
+            if end_mc_batch >= start_mc_batch:
+                log_activity(
+                    st.session_state.current_user,
+                    "search_batch",
+                    f"Searched MC-{start_mc_batch} to MC-{end_mc_batch}"
+                )
         st.session_state.running = False
+        st.session_state.batch_progress = 0
         st.success("Paused sequence.")
 
     if b3.button("♻️ Manual Retry Throttled", use_container_width=True):
@@ -546,6 +556,9 @@ if not show_admin:
 
             # BATCH COMPLETE CHECKPOINT
             if current_batch_count >= target_limit:
+                start_mc_batch = int(st.session_state.current_mc) - target_limit
+                end_mc_batch = int(st.session_state.current_mc) - 1
+
                 if st.session_state.get("auto_retry_enabled", True):
                     total_scraped = len(st.session_state.scraped_rows)
                     start_idx = max(0, total_scraped - target_limit)
@@ -577,9 +590,8 @@ if not show_admin:
                             new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
                             new_parsed = parse_carrier_data(retry_mc, new_raw)
                             st.session_state.scraped_rows[idx] = new_parsed
-                            time.sleep(2.0)  # Paced sleep between retry attempts
+                            time.sleep(2.0)
 
-                    # Check final results for feedback message
                     final_slice = st.session_state.scraped_rows[start_idx:]
                     remaining_throttled = sum(
                         1 for r in final_slice 
@@ -595,6 +607,13 @@ if not show_admin:
                 else:
                     st_box.info(f"🛑 Batch complete! Continuing next batch starting from MC-{st.session_state.current_mc}...")
                     time.sleep(1.5)
+
+                # LOG BATCH ACTIVITY TO DATABASE
+                log_activity(
+                    st.session_state.current_user,
+                    "search_batch",
+                    f"Searched MC-{start_mc_batch} to MC-{end_mc_batch}"
+                )
 
                 # RESET COUNTER & AUTO-CONTINUE NEXT BATCH
                 st.session_state.batch_progress = 0
