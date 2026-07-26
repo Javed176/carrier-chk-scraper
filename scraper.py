@@ -599,7 +599,7 @@ if not show_admin_panel:
     col_in1, col_in2 = st.columns(2)
     with col_in1:
         if st.session_state.current_mc == "":
-            raw_mc_input = st.text_input("Enter Starting MC Number to Begin:", value="", placeholder="e.g., 1066434")
+            raw_mc_input = st.text_input("Enter Starting MC Number to Begin:", value="", placeholder="e.g., 1600000")
             if raw_mc_input.isdigit():
                 st.session_state.current_mc = int(raw_mc_input)
         else:
