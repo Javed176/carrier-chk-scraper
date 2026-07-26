@@ -151,17 +151,17 @@ def parse_carrier_data(mc_number, raw_data):
     contract_auth = str(c.get("contract_authority_status", "")).upper()
     broker_auth = str(c.get("broker_authority_status", "")).upper()
     
-    raw_entity = str(c.get("entity_type", "") or c.get("entity_type_desc", "")).upper()
+    raw_entity = str(c.get("entity_type") or c.get("entity_type_desc") or c.get("operation_classification") or "").upper()
     
-    # Classify Entity Type (Carrier vs Broker vs Both)
-    has_carrier_auth = "ACTIVE" in common_auth or "ACTIVE" in contract_auth or "CARRIER" in raw_entity
-    has_broker_auth = "ACTIVE" in broker_auth or "BROKER" in raw_entity
+    # Accurate Entity Type Detection (Carrier vs Broker)
+    is_broker = "BROKER" in raw_entity or "ACTIVE" in broker_auth or broker_auth == "A"
+    is_carrier = "CARRIER" in raw_entity or "ACTIVE" in common_auth or "ACTIVE" in contract_auth or common_auth == "A" or contract_auth == "A"
     
-    if has_carrier_auth and has_broker_auth:
+    if is_broker and is_carrier:
         entity_label = "CARRIER / BROKER"
-    elif has_broker_auth:
+    elif is_broker:
         entity_label = "BROKER"
-    elif has_carrier_auth:
+    elif is_carrier:
         entity_label = "CARRIER"
     elif raw_entity:
         entity_label = raw_entity
@@ -706,6 +706,10 @@ if not show_admin_panel:
     st.markdown("---")
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
+
+        # Safeguard: ensure 'Entity Type' exists even if old rows are in session state
+        if "Entity Type" not in base_df.columns:
+            base_df["Entity Type"] = "CARRIER"
 
         # --- DYNAMIC DATA FILTERING SECTION ---
         with st.expander("🔍 Filter Collected Records", expanded=True):
