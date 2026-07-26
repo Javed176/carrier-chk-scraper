@@ -226,35 +226,21 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- STRICT HIERARCHICAL CLASSIFICATION ENGINE ---
-    has_carrier_authority = has_common_active or has_contract_active
-    
-    is_carrier_by_data = (
-        has_carrier_authority or 
-        "AUTHORIZED FOR HIRE" in op_class or 
-        "CARRIER" in direct_badge or 
-        "CARRIER" in raw_entity or 
-        "MOTOR" in raw_entity or
-        (pu_count is not None and pu_count >= 0)
-    )
-
-    is_broker_by_data = (
-        has_broker_active or 
-        "BROKER" in direct_badge or 
-        "BROKER" in raw_entity
-    )
-
-    if has_carrier_authority and has_broker_active:
-        entity_label = "CARRIER / BROKER"
-    elif has_carrier_authority or "AUTHORIZED FOR HIRE" in op_class:
-        entity_label = "CARRIER"
-    elif is_broker_by_data and not is_carrier_by_data:
+    # --- ABSOLUTE BADGE-FIRST CLASSIFICATION ENGINE ---
+    if "BROKER" in direct_badge and "CARRIER" not in direct_badge:
         entity_label = "BROKER"
-    elif is_carrier_by_data:
+    elif "CARRIER" in direct_badge and "BROKER" in direct_badge:
+        entity_label = "CARRIER / BROKER"
+    elif "CARRIER" in direct_badge:
+        entity_label = "CARRIER"
+    elif has_common_active or has_contract_active:
+        entity_label = "CARRIER"
+    elif has_broker_active:
+        entity_label = "BROKER"
+    elif "AUTHORIZED FOR HIRE" in op_class or (pu_count is not None and pu_count >= 0):
         entity_label = "CARRIER"
     else:
-        # Fallback keyword checks only if no explicit authority signals are found
-        if "BROKER" in direct_badge or "BROKER" in raw_entity:
+        if "BROKER" in raw_entity:
             entity_label = "BROKER"
         else:
             entity_label = "CARRIER"
