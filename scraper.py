@@ -14,6 +14,7 @@ st.set_page_config(page_title="Carrier Automation Portal", layout="wide")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
 CARRIER_TOKEN = st.secrets.get("CARRIER_TOKEN") or os.environ.get("CARRIER_TOKEN")
+CARRIER_API_URL = st.secrets.get("CARRIER_API_URL") or os.environ.get("CARRIER_API_URL") or "https://carrierchk.com/api/carrier"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("🔑 Database configuration missing! Please add SUPABASE_URL and SUPABASE_KEY to your Streamlit secrets.")
@@ -77,9 +78,9 @@ def get_user_settings(email):
         print(f"Error fetching user settings: {e}")
     return 250.00, 3.0
 
-# --- CARRIERCHK API UTILITIES WITH ROBUST RETRIES ---
-def get_carrier_info(mc_number, token, retries=6):
-    url = "https://carrierchk.com/api/carrier"
+# --- CARRIER API UTILITIES WITH ROBUST RETRIES ---
+def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=6):
+    url = api_url
     params = {
         "type": "mc",
         "value": str(mc_number).strip(),
