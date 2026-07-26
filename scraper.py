@@ -71,7 +71,7 @@ def get_user_settings(email):
     return 500.0, 3.0
 
 # --- ANTI-THROTTLE API CALLER ---
-def get_carrier_info(mc_number, token, retries=4):
+def get_carrier_info(mc_number, token, retries=5):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     
     for attempt in range(retries):
@@ -88,19 +88,19 @@ def get_carrier_info(mc_number, token, retries=4):
                 if retry_after and retry_after.isdigit():
                     time.sleep(float(retry_after))
                 else:
-                    time.sleep(3.0 * (attempt + 1))
+                    time.sleep(4.0 * (attempt + 1))
                 continue
             elif res.status_code in [500, 502, 503, 504]:
                 if attempt < retries - 1:
-                    time.sleep(2.0 * (attempt + 1))
+                    time.sleep(3.0 * (attempt + 1))
                     continue
                 return {"inactive_timeout": True}
             else:
                 if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(2.0 * (attempt + 1))
         except (requests.exceptions.Timeout, requests.exceptions.RequestException):
             if attempt < retries - 1:
-                time.sleep(2.0 * (attempt + 1))
+                time.sleep(2.5 * (attempt + 1))
                 
     return "API_ERROR"
 
@@ -512,7 +512,7 @@ if not show_admin:
                 mc_c = str(row["MC Number"]).replace("MC-", "").strip()
                 st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
                 retried_count += 1
-                time.sleep(0.5)
+                time.sleep(1.0)
                 
         if retried_count > 0:
             st.success(f"Retried {retried_count} throttled record(s)!")
@@ -547,36 +547,51 @@ if not show_admin:
             # BATCH COMPLETE CHECKPOINT
             if current_batch_count >= target_limit:
                 if st.session_state.get("auto_retry_enabled", True):
-                    # ISOLATE AND LOOK BACK ONLY AT THE RECENT BATCH (LAST `target_limit` ITEMS)
                     total_scraped = len(st.session_state.scraped_rows)
                     start_idx = max(0, total_scraped - target_limit)
-                    batch_slice = st.session_state.scraped_rows[start_idx:]
 
-                    # FIND THROTTLED MCs IN THIS SPECIFIC BATCH
-                    throttled_indices = [
-                        start_idx + i for i, r in enumerate(batch_slice)
-                        if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
-                        or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
-                    ]
+                    # PERSISTENT MULTI-PASS RETRY LOOP (Up to 3 passes with increasing backoff)
+                    max_retry_passes = 3
+                    for pass_num in range(1, max_retry_passes + 1):
+                        batch_slice = st.session_state.scraped_rows[start_idx:]
+                        throttled_indices = [
+                            start_idx + i for i, r in enumerate(batch_slice)
+                            if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
+                            or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
+                        ]
 
-                    if throttled_indices:
-                        st_box.warning(f"🛑 Batch of {target_limit} MCs complete. Found {len(throttled_indices)} throttled record(s) in this batch. Cooling down 3.5s before retrying...")
-                        time.sleep(3.5)
-                        
+                        if not throttled_indices:
+                            break  # All throttled items resolved!
+
+                        cool_down = 4.0 * pass_num
+                        st_box.warning(
+                            f"🛑 Batch complete. Found {len(throttled_indices)} throttled record(s). "
+                            f"Retry Pass {pass_num}/{max_retry_passes}: Cooling down {cool_down:.1f}s..."
+                        )
+                        time.sleep(cool_down)
+
                         for count, idx in enumerate(throttled_indices, start=1):
                             retry_mc = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
-                            st_box.info(f"🔄 Retrying throttled MC-{retry_mc} ({count}/{len(throttled_indices)} in batch)...")
-                            
+                            st_box.info(f"🔄 Retrying MC-{retry_mc} (Pass {pass_num} | {count}/{len(throttled_indices)})...")
+
                             new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
                             new_parsed = parse_carrier_data(retry_mc, new_raw)
                             st.session_state.scraped_rows[idx] = new_parsed
-                            time.sleep(1.0)
+                            time.sleep(2.0)  # Paced sleep between retry attempts
 
-                        st_box.success(f"✅ Batch complete! Retried throttled records. Continuing next batch starting from MC-{st.session_state.current_mc}...")
-                        time.sleep(1.5)
+                    # Check final results for feedback message
+                    final_slice = st.session_state.scraped_rows[start_idx:]
+                    remaining_throttled = sum(
+                        1 for r in final_slice 
+                        if "THROTTLED" in str(r.get("Carrier Name", "")).upper() or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
+                    )
+
+                    if remaining_throttled == 0:
+                        st_box.success(f"✅ Batch complete! All MCs verified with 0 throttled errors. Continuing next batch starting from MC-{st.session_state.current_mc}...")
                     else:
-                        st_box.success(f"✅ Batch complete! 0 throttled records. Continuing next batch starting from MC-{st.session_state.current_mc}...")
-                        time.sleep(1.5)
+                        st_box.warning(f"⚠️ Batch finished with {remaining_throttled} persistent throttle error(s). Continuing next batch starting from MC-{st.session_state.current_mc}...")
+
+                    time.sleep(1.5)
                 else:
                     st_box.info(f"🛑 Batch complete! Continuing next batch starting from MC-{st.session_state.current_mc}...")
                     time.sleep(1.5)
@@ -588,8 +603,8 @@ if not show_admin:
 
             # Circuit breaker delay if current request returned throttle warning
             if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
-                st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 3.5s...")
-                time.sleep(3.5)
+                st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 4.0s...")
+                time.sleep(4.0)
             else:
                 time.sleep(max(0.3, delay_ms / 1000.0))
         st.rerun()
