@@ -110,7 +110,6 @@ def get_carrier_info(mc_number, token, api_url=CARRIER_API_URL, retries=3):
                 if isinstance(data, dict) and ("carrier" in data or "error" in data):
                     return data
             elif response.status_code == 429:
-                # Dynamic backoff pause when server rate limit is triggered
                 time.sleep(1.5 * (attempt + 1))
                 continue
         except requests.exceptions.RequestException:
@@ -126,6 +125,7 @@ def parse_carrier_data(mc_number, raw_data):
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "⚠️ API THROTTLED (RETRY NEEDED)",
+            "Entity Type": "N/A",
             "Operating Status": "⚠️ UNKNOWN",
             "Phone Number": "N/A",
             "Email Address": "N/A",
@@ -136,6 +136,7 @@ def parse_carrier_data(mc_number, raw_data):
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND / DEAD NUMBER",
+            "Entity Type": "N/A",
             "Operating Status": "❌ INVALID",
             "Phone Number": "N/A",
             "Email Address": "N/A",
@@ -148,12 +149,31 @@ def parse_carrier_data(mc_number, raw_data):
     allowed_to_operate = str(c.get("allowed_to_operate", "")).upper()
     common_auth = str(c.get("common_authority_status", "")).upper()
     contract_auth = str(c.get("contract_authority_status", "")).upper()
+    broker_auth = str(c.get("broker_authority_status", "")).upper()
     
+    raw_entity = str(c.get("entity_type", "") or c.get("entity_type_desc", "")).upper()
+    
+    # Classify Entity Type (Carrier vs Broker vs Both)
+    has_carrier_auth = "ACTIVE" in common_auth or "ACTIVE" in contract_auth or "CARRIER" in raw_entity
+    has_broker_auth = "ACTIVE" in broker_auth or "BROKER" in raw_entity
+    
+    if has_carrier_auth and has_broker_auth:
+        entity_label = "CARRIER / BROKER"
+    elif has_broker_auth:
+        entity_label = "BROKER"
+    elif has_carrier_auth:
+        entity_label = "CARRIER"
+    elif raw_entity:
+        entity_label = raw_entity
+    else:
+        entity_label = "CARRIER"
+
     is_active = (
         status_code == "A" 
         or allowed_to_operate == "Y" 
         or "ACTIVE" in common_auth 
         or "ACTIVE" in contract_auth
+        or "ACTIVE" in broker_auth
     )
     
     if is_active:
@@ -176,6 +196,7 @@ def parse_carrier_data(mc_number, raw_data):
     return {
         "MC Number": f"MC-{mc_number}",
         "Carrier Name": c.get("dba_name") or c.get("legal_name") or "N/A",
+        "Entity Type": entity_label,
         "Operating Status": status,
         "Phone Number": phone,
         "Email Address": email,
@@ -599,7 +620,7 @@ if not show_admin_panel:
     col_in1, col_in2 = st.columns(2)
     with col_in1:
         if st.session_state.current_mc == "":
-            raw_mc_input = st.text_input("Enter Starting MC Number to Begin:", value="", placeholder="e.g., 1600000")
+            raw_mc_input = st.text_input("Enter Starting MC Number to Begin:", value="", placeholder="e.g., 1066434")
             if raw_mc_input.isdigit():
                 st.session_state.current_mc = int(raw_mc_input)
         else:
@@ -631,7 +652,6 @@ if not show_admin_panel:
             
         st.success(f"Automation paused cleanly at MC-{st.session_state.current_mc}")
 
-    # Re-try throttled records button
     if col_btn3.button("♻️ Retry Throttled Rows", use_container_width=True):
         throttled_indexes = [
             i for i, r in enumerate(st.session_state.scraped_rows) 
@@ -661,7 +681,6 @@ if not show_admin_panel:
         status_box = st.empty()
         
         BATCH_SIZE = 5
-        # Enforce minimum safe delay floor of 300ms (0.3s) between calls to prevent 429 API rate limits
         safety_delay_seconds = max(0.30, current_delay_ms / 1000.0)
         
         for _ in range(BATCH_SIZE):
@@ -683,17 +702,62 @@ if not show_admin_panel:
                 
         st.rerun()
 
-    # --- TABBED DISPLAY & EXPORT ---
+    # --- TABBED DISPLAY, FILTERING & EXPORT ---
     st.markdown("---")
     if st.session_state.scraped_rows:
         base_df = pd.DataFrame(st.session_state.scraped_rows)
+
+        # --- DYNAMIC DATA FILTERING SECTION ---
+        with st.expander("🔍 Filter Collected Records", expanded=True):
+            col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+            
+            with col_f1:
+                search_query = st.text_input("🔎 Search Name or MC:", value="", placeholder="e.g. LOGISTICS or 1800016")
+                
+            with col_f2:
+                all_entities = ["ALL"] + sorted([e for e in base_df["Entity Type"].unique() if e != "N/A"])
+                selected_entity = st.selectbox("🚛 Filter Entity Type:", all_entities)
+
+            with col_f3:
+                all_statuses = ["ALL"] + sorted(list(base_df["Operating Status"].unique()))
+                selected_status = st.selectbox("📌 Filter Status:", all_statuses)
+                
+            with col_f4:
+                extracted_states = set()
+                for loc in base_df["Location"].dropna():
+                    if "," in loc:
+                        extracted_states.add(loc.split(",")[-1].strip())
+                all_states = ["ALL"] + sorted(list(extracted_states))
+                selected_state = st.selectbox("📍 Filter State:", all_states)
+
+        # Apply Filters to Create Filtered DataFrame
+        filtered_df = base_df.copy()
+
+        if search_query.strip():
+            sq = search_query.strip().lower()
+            filtered_df = filtered_df[
+                filtered_df["Carrier Name"].str.lower().str.contains(sq, na=False) |
+                filtered_df["MC Number"].str.lower().str.contains(sq, na=False)
+            ]
+
+        if selected_entity != "ALL":
+            filtered_df = filtered_df[filtered_df["Entity Type"] == selected_entity]
+
+        if selected_status != "ALL":
+            filtered_df = filtered_df[filtered_df["Operating Status"] == selected_status]
+
+        if selected_state != "ALL":
+            filtered_df = filtered_df[filtered_df["Location"].str.endswith(selected_state, na=False)]
+
+        st.caption(f"Showing **{len(filtered_df)}** of **{len(base_df)}** total harvested records.")
+
         tab1, tab2, tab3 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Active Only)", "📧 Raw Active Email List"])
         
         with tab1:
-            st.subheader("Master History Sheet (All Results)")
-            st.dataframe(base_df, use_container_width=True)
+            st.subheader("Master History Sheet (Filtered Results)")
+            st.dataframe(filtered_df, use_container_width=True)
             
-            master_csv = base_df.to_csv(index=False).encode('utf-8')
+            master_csv = filtered_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Export Master Sheet to CSV",
                 data=master_csv,
@@ -705,15 +769,15 @@ if not show_admin_panel:
             
         with tab2:
             st.subheader("Clean Target Pitch Sheet (ACTIVE Carriers Only)")
-            leads_df = base_df[
-                (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
-                (base_df["Email Address"] != "N/A") & 
-                (base_df["Email Address"] != "Not Listed") & 
-                (base_df["Email Address"].str.contains("@", na=False))
+            leads_df = filtered_df[
+                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
+                (filtered_df["Email Address"] != "N/A") & 
+                (filtered_df["Email Address"] != "Not Listed") & 
+                (filtered_df["Email Address"].str.contains("@", na=False))
             ]
             
             if not leads_df.empty:
-                st.success(f"Found {len(leads_df)} active carrier targets with full contact records!")
+                st.success(f"Found {len(leads_df)} active targets matching your filter criteria!")
                 st.dataframe(leads_df, use_container_width=True)
                 
                 leads_csv = leads_df.to_csv(index=False).encode('utf-8')
@@ -726,21 +790,21 @@ if not show_admin_panel:
                     key="leads_download"
                 )
             else:
-                st.info("No active carrier leads with email addresses identified in this sequence run yet.")
+                st.info("No active leads with email addresses match your current filters.")
 
         with tab3:
             st.subheader("Isolated Email Blast Column (ACTIVE Carriers Only)")
-            valid_emails = base_df[
-                (base_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
-                (base_df["Email Address"] != "N/A") & 
-                (base_df["Email Address"] != "Not Listed") & 
-                (base_df["Email Address"].str.contains("@", na=False))
+            valid_emails = filtered_df[
+                (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE", na=False)) &
+                (filtered_df["Email Address"] != "N/A") & 
+                (filtered_df["Email Address"] != "Not Listed") & 
+                (filtered_df["Email Address"].str.contains("@", na=False))
             ]["Email Address"].drop_duplicates()
             
             if not valid_emails.empty:
                 just_emails_df = pd.DataFrame({"Email Address": valid_emails})
                 
-                st.success(f"Found {len(just_emails_df)} unique emails from ACTIVE carriers!")
+                st.success(f"Found {len(just_emails_df)} unique emails from ACTIVE records matching your filters!")
                 st.dataframe(just_emails_df, use_container_width=True)
                 
                 email_text = "\n".join(just_emails_df["Email Address"].tolist())
@@ -756,6 +820,6 @@ if not show_admin_panel:
                     key="raw_emails_download"
                 )
             else:
-                st.info("No active carrier emails found to populate the mailing column yet.")
+                st.info("No active carrier emails match your current filters.")
     else:
         st.info("No data rows collected in this run yet. Click 'Start Sequence' to begin harvesting.")
