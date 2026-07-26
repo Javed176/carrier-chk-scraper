@@ -42,7 +42,7 @@ def log_activity(email, action, detail=""):
         pass
 
 def get_system_config():
-    config = {"throttle_delay_ms": 300.0, "override_global_speed": False}
+    config = {"throttle_delay_ms": 500.0, "override_global_speed": False}
     try:
         res = supabase.table("system_config").select("*").execute()
         for r in res.data:
@@ -65,12 +65,12 @@ def get_user_settings(email):
     try:
         res = supabase.table("users").select("delay_ms, session_duration_hours").eq("email", email).execute()
         if res.data:
-            return float(res.data[0].get("delay_ms", 300.0)), float(res.data[0].get("session_duration_hours", 3.0))
+            return float(res.data[0].get("delay_ms", 500.0)), float(res.data[0].get("session_duration_hours", 3.0))
     except Exception:
         pass
-    return 300.0, 3.0
+    return 500.0, 3.0
 
-# --- IMPROVED API FETCH WITH ROBUST THROTTLE RECOVERY ---
+# --- ANTI-THROTTLE API CALLER ---
 def get_carrier_info(mc_number, token, retries=3):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     
@@ -84,25 +84,28 @@ def get_carrier_info(mc_number, token, retries=3):
             elif res.status_code in [404, 400]:
                 return {"not_found": True}
             elif res.status_code == 429:
-                # Exponential backoff for rate limiting
-                time.sleep(1.5 * (attempt + 1))
+                retry_after = res.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    time.sleep(float(retry_after))
+                else:
+                    time.sleep(2.5 * (attempt + 1))
                 continue
             elif res.status_code in [500, 502, 503, 504]:
                 if attempt < retries - 1:
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(1.5 * (attempt + 1))
                     continue
                 return {"inactive_timeout": True}
             else:
                 if attempt < retries - 1:
-                    time.sleep(0.8 * (attempt + 1))
+                    time.sleep(1.0 * (attempt + 1))
         except (requests.exceptions.Timeout, requests.exceptions.RequestException):
             if attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(1.5 * (attempt + 1))
                 
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
-    # 1. Genuine API Failure or Throttle exhaustion
+    # 1. API Failure / Rate Limit exhaustion
     if raw_data == "API_ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -114,7 +117,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 2. Inactive docket / Server timeout
+    # 2. Inactive docket / Server side timeout
     if isinstance(raw_data, dict) and raw_data.get("inactive_timeout") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -182,7 +185,9 @@ def parse_carrier_data(mc_number, raw_data):
     def is_strictly_active(val):
         if not val: return False
         v = str(val).strip().upper()
-        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED", "N"]):
+        if v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED", "NONE ON FILE"]:
+            return False
+        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED"]):
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
@@ -191,13 +196,11 @@ def parse_carrier_data(mc_number, raw_data):
     contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
     broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
 
-    has_mc_auth = (common_auth is not None or contract_auth is not None)
-    has_broker_auth = (broker_auth is not None)
-
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
 
+    # Power units count
     power_units_raw = c.get("power_units") if c.get("power_units") is not None else c.get("powerUnits")
     try:
         pu_count = int(power_units_raw)
@@ -222,29 +225,31 @@ def parse_carrier_data(mc_number, raw_data):
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
     # Exact CarrierCheck Badge Matching
-    direct_badge = str(c.get("badge") or c.get("entity_badge") or "").strip().upper()
+    direct_badge = str(c.get("badge") or c.get("entity_badge") or c.get("classification") or "").strip().upper()
     
-    if "BROKER" in direct_badge:
+    if "BROKER" in direct_badge and "CARRIER" not in direct_badge:
         entity_label = "BROKER"
-    elif "CARRIER" in direct_badge:
+    elif "CARRIER" in direct_badge and "BROKER" not in direct_badge:
         entity_label = "CARRIER"
     else:
-        is_broker = has_broker_auth or "BROKER" in raw_entity or "FORWARDER" in raw_entity
-        is_carrier = "CARRIER" in raw_entity or "MOTOR" in raw_entity or has_mc_auth or (pu_count is not None and pu_count > 0)
+        is_carrier_auth = has_common_active or has_contract_active
+        is_broker_auth = has_broker_active
 
-        if pu_count == 0 and not has_mc_auth and ("CARRIER" not in raw_entity):
-            is_carrier = False
-            if is_broker or "BROKER" in name:
-                is_broker = True
+        # Fallback if specific authority status fields are unspecified
+        if not is_carrier_auth and not is_broker_auth:
+            if "BROKER" in raw_entity or "FORWARDER" in raw_entity or "BROKER" in name:
+                is_broker_auth = True
+            if "CARRIER" in raw_entity or "MOTOR" in raw_entity or (pu_count is not None and pu_count > 0):
+                is_carrier_auth = True
 
-        if is_broker and is_carrier:
+        if is_broker_auth and is_carrier_auth:
             entity_label = "CARRIER / BROKER"
-        elif is_carrier:
-            entity_label = "CARRIER"
-        elif is_broker:
+        elif is_broker_auth or (pu_count == 0 and not is_carrier_auth):
             entity_label = "BROKER"
+        elif is_carrier_auth or (pu_count is not None and pu_count > 0):
+            entity_label = "CARRIER"
         else:
-            entity_label = "BROKER" if "BROKER" in name else "CARRIER"
+            entity_label = "BROKER" if ("BROKER" in name or "LOGISTICS" in name) else "CARRIER"
 
     # Contact & Location Parsing
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
@@ -334,9 +339,9 @@ if now - st.session_state.last_db_check > 30.0:
         st.session_state.cached_speed_str = f"👤 {st.session_state.cached_delay_ms:.2f} ms"
     st.session_state.last_db_check = now
 
-delay_ms = st.session_state.get("cached_delay_ms", 300.0)
+delay_ms = st.session_state.get("cached_delay_ms", 500.0)
 session_dur = st.session_state.get("cached_dur", 3.0)
-speed_str = st.session_state.get("cached_speed_str", "300 ms")
+speed_str = st.session_state.get("cached_speed_str", "500 ms")
 
 if st.session_state.login_time and (time.time() - st.session_state.login_time >= session_dur * 3600):
     force_logout("Auto-Expired")
@@ -380,7 +385,7 @@ if show_admin and st.session_state.is_admin:
         u_role = col_a3.selectbox("Role:", ["Standard User", "Super Admin"])
         
         col_a4, col_a5 = st.columns(2)
-        u_delay = col_a4.number_input("Speed Limit (ms):", value=300.0, step=10.0)
+        u_delay = col_a4.number_input("Speed Limit (ms):", value=500.0, step=10.0)
         u_hrs = col_a5.number_input("Session Timeout (Hours):", value=3.0, step=0.5)
         
         if st.button("➕ Add User Account", use_container_width=True) and u_email and u_pass:
@@ -407,7 +412,7 @@ if show_admin and st.session_state.is_admin:
                 col_e1, col_e2, col_e3 = st.columns(3)
                 e_pass = col_e1.text_input("Change Password:", value=str(target_user.get("password", "")))
                 e_hrs = col_e2.number_input("Session Lockout Timeout (Hours):", min_value=0.1, max_value=24.0, value=float(target_user.get("session_duration_hours", 3.0)), step=0.5)
-                e_delay = col_e3.number_input("Speed Limit (ms):", min_value=1.0, value=float(target_user.get("delay_ms", 300.0)), step=10.0)
+                e_delay = col_e3.number_input("Speed Limit (ms):", min_value=1.0, value=float(target_user.get("delay_ms", 500.0)), step=10.0)
                 
                 if st.button("💾 Apply Account Updates", use_container_width=True):
                     supabase.table("users").update({
@@ -499,7 +504,7 @@ if not show_admin:
                 mc_c = str(row["MC Number"]).replace("MC-", "").strip()
                 st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
                 retried_count += 1
-                time.sleep(0.3)
+                time.sleep(0.5)
                 
         if retried_count > 0:
             st.success(f"Retried {retried_count} throttled record(s)!")
@@ -520,9 +525,15 @@ if not show_admin:
             st_box.info(f"⚡ Live Scraping | Target: **MC-{target}**...")
             
             raw_info = get_carrier_info(target, CARRIER_TOKEN)
-            st.session_state.scraped_rows.append(parse_carrier_data(target, raw_info))
+            parsed_record = parse_carrier_data(target, raw_info)
+            st.session_state.scraped_rows.append(parsed_record)
             st.session_state.current_mc += 1
-            time.sleep(max(0.1, delay_ms / 1000.0))
+            
+            if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
+                st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 3.5s...")
+                time.sleep(3.5)
+            else:
+                time.sleep(max(0.3, delay_ms / 1000.0))
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
