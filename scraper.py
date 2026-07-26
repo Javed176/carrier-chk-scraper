@@ -1,5 +1,4 @@
 import os, time, uuid, requests, pandas as pd
-from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -29,7 +28,7 @@ def get_supabase() -> Client:
 @st.cache_resource
 def get_http() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"})
     return s
 
 supabase = get_supabase()
@@ -71,37 +70,39 @@ def get_user_settings(email):
         pass
     return 300.0, 3.0
 
-# --- API & DYNAMIC WAIT / 10-SEC TIMEOUT LOGIC ---
-def get_carrier_info(mc_number, token, retries=1):
+# --- IMPROVED API FETCH WITH ROBUST THROTTLE RECOVERY ---
+def get_carrier_info(mc_number, token, retries=3):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
-    for attempt in range(retries + 1):
+    
+    for attempt in range(retries):
         try:
-            res = http_session.get(CARRIER_API_URL, params=params, timeout=10.0)
+            res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
             
             if res.status_code == 200:
                 data = res.json()
                 return data
             elif res.status_code in [404, 400]:
                 return {"not_found": True}
-            elif res.status_code in [500, 502, 503, 504]:
-                return {"inactive_timeout": True}
             elif res.status_code == 429:
-                time.sleep(1.2 * (attempt + 1))
+                # Exponential backoff for rate limiting
+                time.sleep(1.5 * (attempt + 1))
                 continue
+            elif res.status_code in [500, 502, 503, 504]:
+                if attempt < retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                return {"inactive_timeout": True}
             else:
-                if attempt < retries:
-                    time.sleep(0.5)
-        except requests.exceptions.Timeout:
-            if attempt < retries:
-                time.sleep(0.8)
-        except requests.exceptions.RequestException:
-            if attempt < retries:
-                time.sleep(0.5)
+                if attempt < retries - 1:
+                    time.sleep(0.8 * (attempt + 1))
+        except (requests.exceptions.Timeout, requests.exceptions.RequestException):
+            if attempt < retries - 1:
+                time.sleep(1.0 * (attempt + 1))
                 
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
-    # 1. Genuine API Failure or Rate Limit after 10-sec timeout
+    # 1. Genuine API Failure or Throttle exhaustion
     if raw_data == "API_ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -113,7 +114,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 2. Inactive docket that timed out on FMCSA server side
+    # 2. Inactive docket / Server timeout
     if isinstance(raw_data, dict) and raw_data.get("inactive_timeout") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -125,7 +126,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # 3. Non-existent MC / Docket Not Found (HTTP 404 or empty object)
+    # 3. Docket Not Found
     if not raw_data or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
         return {
             "MC Number": f"MC-{mc_number}",
@@ -137,7 +138,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Payload level error check
     if raw_data.get("error") or raw_data.get("message") == "Not Found":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -174,40 +174,37 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    # Extract Raw Entity Type from API payload
+    # Extract Raw Entity Type
     raw_entity = str(
         c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or c.get("operation_classification") or ""
     ).strip().upper()
 
-    # Helper function to check explicit active authority status values
     def is_strictly_active(val):
         if not val: return False
         v = str(val).strip().upper()
-        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DISMISS", "DENIED", "N"]):
+        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED", "N"]):
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
-    # Authority Field Checks
-    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or c.get("common_status")
-    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status")
+    # Authority Status Check
+    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
+    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
+    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
 
-    # Raw presence of authority records (regardless of whether active or revoked)
-    has_mc_auth_record = (common_auth is not None or contract_auth is not None)
-    has_broker_auth_record = (broker_auth is not None)
+    has_mc_auth = (common_auth is not None or contract_auth is not None)
+    has_broker_auth = (broker_auth is not None)
 
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
     has_broker_active = is_strictly_active(broker_auth)
 
-    # Power Units Check
     power_units_raw = c.get("power_units") if c.get("power_units") is not None else c.get("powerUnits")
     try:
         pu_count = int(power_units_raw)
     except (ValueError, TypeError):
         pu_count = None
 
-    # Operating Status Determination
+    # Status Determination
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
@@ -224,30 +221,32 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- REFINED ENTITY TYPE DETERMINATION ---
-    is_broker = has_broker_auth_record or "BROKER" in raw_entity or "FORWARDER" in raw_entity
-    is_carrier = "CARRIER" in raw_entity or "MOTOR" in raw_entity or has_mc_auth_record or (pu_count is not None and pu_count > 0)
-
-    # Override for zero-fleet brokers without motor carrier authority
-    if pu_count == 0 and not has_mc_auth_record and ("CARRIER" not in raw_entity):
-        is_carrier = False
-        if is_broker or "BROKER" in name:
-            is_broker = True
-
-    if is_broker and is_carrier:
-        entity_label = "CARRIER / BROKER"
-    elif is_carrier:
-        entity_label = "CARRIER"
-    elif is_broker:
+    # Exact CarrierCheck Badge Matching
+    direct_badge = str(c.get("badge") or c.get("entity_badge") or "").strip().upper()
+    
+    if "BROKER" in direct_badge:
         entity_label = "BROKER"
+    elif "CARRIER" in direct_badge:
+        entity_label = "CARRIER"
     else:
-        # Strict fallback: default to CARRIER unless BROKER is explicitly in the company name
-        if "BROKER" in name:
+        is_broker = has_broker_auth or "BROKER" in raw_entity or "FORWARDER" in raw_entity
+        is_carrier = "CARRIER" in raw_entity or "MOTOR" in raw_entity or has_mc_auth or (pu_count is not None and pu_count > 0)
+
+        if pu_count == 0 and not has_mc_auth and ("CARRIER" not in raw_entity):
+            is_carrier = False
+            if is_broker or "BROKER" in name:
+                is_broker = True
+
+        if is_broker and is_carrier:
+            entity_label = "CARRIER / BROKER"
+        elif is_carrier:
+            entity_label = "CARRIER"
+        elif is_broker:
             entity_label = "BROKER"
         else:
-            entity_label = "CARRIER"
+            entity_label = "BROKER" if "BROKER" in name else "CARRIER"
 
-    # Contact & Location
+    # Contact & Location Parsing
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
