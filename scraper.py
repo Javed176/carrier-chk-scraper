@@ -227,10 +227,7 @@ def parse_carrier_data(mc_number, raw_data):
     is_carrier_badge = any(term in direct_badge or term in raw_entity or term in op_class or term in str(c).upper() for term in ["CARRIER", "MOTOR", "COMMON", "CONTRACT"])
 
     if has_broker_active or is_broker_badge or is_broker_keyword:
-        if has_common_active or has_contract_active or is_carrier_badge or is_carrier_keyword:
-            entity_label = "CARRIER / BROKER"
-        else:
-            entity_label = "BROKER"
+        entity_label = "BROKER"
     elif has_common_active or has_contract_active or is_carrier_badge or is_carrier_keyword:
         entity_label = "CARRIER"
     else:
