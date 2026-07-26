@@ -220,24 +220,19 @@ def parse_carrier_data(mc_number, raw_data):
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
     # --- PRECISE AUTHORITY & BADGE CLASSIFICATION ENGINE ---
-    is_carrier_auth = has_common_active or has_contract_active
-    is_broker_auth = has_broker_active or "BROKER" in direct_badge or "BROKER" in raw_entity
+    is_broker_badge = any(term in direct_badge or term in raw_entity or term in op_class or term in str(c).upper() for term in ["BROKER", "PROPERTY BROKER"])
+    is_carrier_badge = any(term in direct_badge or term in raw_entity or term in op_class for term in ["CARRIER", "COMMON CARRIER", "CONTRACT CARRIER"])
 
-    if is_carrier_auth and is_broker_auth:
-        entity_label = "CARRIER / BROKER"
-    elif is_broker_auth and not is_carrier_auth:
+    if is_broker_badge and not (has_common_active or has_contract_active):
         entity_label = "BROKER"
-    elif is_carrier_auth:
+    elif (has_common_active or has_contract_active) and (has_broker_active or is_broker_badge):
+        entity_label = "CARRIER / BROKER"
+    elif has_common_active or has_contract_active:
         entity_label = "CARRIER"
-    elif "CARRIER" in direct_badge and "BROKER" not in direct_badge:
-        entity_label = "CARRIER"
-    elif "BROKER" in direct_badge and "CARRIER" not in direct_badge:
+    elif has_broker_active or is_broker_badge:
         entity_label = "BROKER"
     else:
-        if "BROKER" in raw_entity or "BROKER" in op_class:
-            entity_label = "BROKER"
-        else:
-            entity_label = "CARRIER"
+        entity_label = "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
