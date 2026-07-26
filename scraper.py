@@ -71,25 +71,39 @@ def get_user_settings(email):
         pass
     return 300.0, 3.0
 
-# --- API & RIGOROUS FMCSA ENTITY/STATUS PARSING ---
-def get_carrier_info(mc_number, token, retries=3):
+# --- API & DYNAMIC WAIT / 7-SEC TIMEOUT LOGIC ---
+def get_carrier_info(mc_number, token, retries=1):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     for attempt in range(retries + 1):
         try:
-            res = http_session.get(CARRIER_API_URL, params=params, timeout=4.0)
+            # Dynamic response wait: advances instantly on response, max 7s timeout
+            res = http_session.get(CARRIER_API_URL, params=params, timeout=7.0)
+            
             if res.status_code == 200:
                 data = res.json()
-                if isinstance(data, dict) and ("carrier" in data or "error" in data or "data" in data):
-                    return data
+                return data
+            elif res.status_code == 404:
+                # Immediate explicit handling for non-existent carrier dockets
+                return {"not_found": True}
             elif res.status_code == 429:
-                time.sleep(1.2 * (attempt + 1))
+                # Server throttle / rate limit
+                time.sleep(1.0 * (attempt + 1))
                 continue
+            else:
+                if attempt < retries:
+                    time.sleep(0.5)
+        except requests.exceptions.Timeout:
+            # Hit 7-second max timeout threshold
+            if attempt < retries:
+                time.sleep(0.5)
         except requests.exceptions.RequestException:
-            pass
-        if attempt < retries: time.sleep(0.3 * (attempt + 1))
+            if attempt < retries:
+                time.sleep(0.5)
+                
     return "API_ERROR"
 
 def parse_carrier_data(mc_number, raw_data):
+    # 1. Actual Timeout or Throttling after 7 seconds
     if raw_data == "API_ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
@@ -101,12 +115,25 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    if not raw_data or not isinstance(raw_data, dict):
+    # 2. Non-existent MC / Docket Not Found (HTTP 404 or empty object)
+    if not raw_data or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND",
             "Entity Type": "N/A",
-            "Operating Status": "❌ INVALID",
+            "Operating Status": "❌ NOT FOUND",
+            "Phone Number": "N/A",
+            "Email Address": "N/A",
+            "Location": "N/A"
+        }
+
+    # Check for payload level "Not Found" or "Error" responses
+    if raw_data.get("error") or raw_data.get("message") == "Not Found":
+        return {
+            "MC Number": f"MC-{mc_number}",
+            "Carrier Name": "DOCKET NOT FOUND",
+            "Entity Type": "N/A",
+            "Operating Status": "❌ NOT FOUND",
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
@@ -118,7 +145,7 @@ def parse_carrier_data(mc_number, raw_data):
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND",
             "Entity Type": "N/A",
-            "Operating Status": "❌ INVALID",
+            "Operating Status": "❌ NOT FOUND",
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
@@ -126,8 +153,16 @@ def parse_carrier_data(mc_number, raw_data):
 
     # Extract Carrier / Business Name
     name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").strip().upper()
-    if name in ["NONE", "NULL", "", "N/A"]:
-        name = "DOCKET NOT FOUND"
+    if name in ["NONE", "NULL", "", "N/A", "NOT FOUND"]:
+        return {
+            "MC Number": f"MC-{mc_number}",
+            "Carrier Name": "DOCKET NOT FOUND",
+            "Entity Type": "N/A",
+            "Operating Status": "❌ NOT FOUND",
+            "Phone Number": "N/A",
+            "Email Address": "N/A",
+            "Location": "N/A"
+        }
 
     # Extract Raw Entity Type
     raw_entity = str(
@@ -474,7 +509,7 @@ if not show_admin:
             raw_info = get_carrier_info(target, CARRIER_TOKEN)
             st.session_state.scraped_rows.append(parse_carrier_data(target, raw_info))
             st.session_state.current_mc += 1
-            time.sleep(max(0.25, delay_ms / 1000.0))
+            time.sleep(max(0.1, delay_ms / 1000.0))
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
