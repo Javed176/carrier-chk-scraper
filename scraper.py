@@ -185,10 +185,14 @@ def parse_carrier_data(mc_number, raw_data):
         c.get("badge") or c.get("entity_badge") or c.get("classification") or c.get("badge_type") or ""
     ).strip().upper()
 
+    def extract_status(val):
+        if isinstance(val, dict):
+            return str(val.get("status") or val.get("desc") or val.get("value") or "").upper()
+        return str(val or "").upper()
+
     def is_strictly_active(val):
-        if not val: return False
-        v = str(val).strip().upper()
-        if v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED", "NONE ON FILE"]:
+        v = extract_status(val)
+        if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED", "NONE ON FILE"]:
             return False
         if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED"]):
             return False
@@ -211,35 +215,47 @@ def parse_carrier_data(mc_number, raw_data):
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
-    is_active = (
-        allowed_op in ["Y", "YES", "TRUE"] or
-        status_field in ["A", "ACTIVE", "AUTHORIZED"] or
-        has_common_active or
-        has_contract_active or
-        has_broker_active
-    )
-
-    if (status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE"] or allowed_op in ["N", "NO"]) and not (has_common_active or has_contract_active or has_broker_active):
+    # STRICT STATUS CHECK
+    if allowed_op in ["N", "NO", "FALSE"] or status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE", "SUSPENDED", "NONE"]:
         is_active = False
+    elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
+        is_active = True
+    else:
+        is_active = has_common_active or has_contract_active or has_broker_active
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- ENTITY TYPE CLASSIFICATION LOGIC ---
-    is_carrier_auth = has_common_active or has_contract_active or ("AUTHORIZED FOR HIRE" in op_class) or ("CARRIER" in direct_badge)
-    is_broker_auth = has_broker_active or ("BROKER" in direct_badge)
+    # STRICT CLASSIFICATION ENGINE
+    is_carrier_type = (
+        has_common_active or 
+        has_contract_active or 
+        "AUTHORIZED FOR HIRE" in op_class or 
+        "CARRIER" in direct_badge or 
+        "CARRIER" in raw_entity or 
+        "MOTOR" in raw_entity or
+        "EXPRESS" in name or
+        "TRUCKING" in name or
+        "LOGISTICS" in name or
+        (pu_count is not None and pu_count >= 0)
+    )
 
-    if is_broker_auth and is_carrier_auth:
-        entity_label = "CARRIER / BROKER"
-    elif is_carrier_auth:
-        entity_label = "CARRIER"
-    elif is_broker_auth:
+    is_broker_type = (
+        has_broker_active or 
+        "BROKER" in direct_badge or 
+        "BROKER" in raw_entity
+    )
+
+    if is_broker_type and is_carrier_type:
+        if has_broker_active and (has_common_active or has_contract_active):
+            entity_label = "CARRIER / BROKER"
+        elif has_broker_active:
+            entity_label = "BROKER"
+        else:
+            entity_label = "CARRIER"
+    elif is_broker_type:
         entity_label = "BROKER"
-    elif "BROKER" in raw_entity or "FORWARDER" in raw_entity or "BROKER" in name:
-        entity_label = "BROKER"
-    elif "CARRIER" in raw_entity or "MOTOR" in raw_entity or (pu_count is not None and pu_count > 0):
-        entity_label = "CARRIER"
     else:
-        entity_label = "BROKER" if ("BROKER" in name or "LOGISTICS" in name or "FREIGHT" in name) else "CARRIER"
+        entity_label = "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
