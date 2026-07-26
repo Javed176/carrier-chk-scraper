@@ -71,7 +71,7 @@ def get_user_settings(email):
     return 500.0, 3.0
 
 # --- ANTI-THROTTLE API CALLER ---
-def get_carrier_info(mc_number, token, retries=3):
+def get_carrier_info(mc_number, token, retries=4):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     
     for attempt in range(retries):
@@ -88,19 +88,19 @@ def get_carrier_info(mc_number, token, retries=3):
                 if retry_after and retry_after.isdigit():
                     time.sleep(float(retry_after))
                 else:
-                    time.sleep(2.5 * (attempt + 1))
+                    time.sleep(3.0 * (attempt + 1))
                 continue
             elif res.status_code in [500, 502, 503, 504]:
                 if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(2.0 * (attempt + 1))
                     continue
                 return {"inactive_timeout": True}
             else:
                 if attempt < retries - 1:
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(1.5 * (attempt + 1))
         except (requests.exceptions.Timeout, requests.exceptions.RequestException):
             if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(2.0 * (attempt + 1))
                 
     return "API_ERROR"
 
@@ -235,7 +235,6 @@ def parse_carrier_data(mc_number, raw_data):
         is_carrier_auth = has_common_active or has_contract_active
         is_broker_auth = has_broker_active
 
-        # Fallback if specific authority status fields are unspecified
         if not is_carrier_auth and not is_broker_auth:
             if "BROKER" in raw_entity or "FORWARDER" in raw_entity or "BROKER" in name:
                 is_broker_auth = True
@@ -275,7 +274,8 @@ def parse_carrier_data(mc_number, raw_data):
 # --- STATE INIT ---
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
-                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0)]:
+                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
+                 ("auto_retry_enabled", False), ("auto_retry_interval", 25)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -483,6 +483,24 @@ if not show_admin:
     with c2:
         st.metric("Session Speed Enforced", speed_str)
 
+    # --- ADVANCED THROTTLING & AUTO-RETRY SETTINGS ---
+    with st.expander("⚙️ Advanced Throttling & Auto-Retry Settings", expanded=True):
+        col_ar1, col_ar2 = st.columns([1, 1])
+        st.session_state.auto_retry_enabled = col_ar1.checkbox(
+            "🔄 Auto Retry Throttled", 
+            value=st.session_state.get("auto_retry_enabled", False)
+        )
+        st.session_state.auto_retry_interval = col_ar2.number_input(
+            "Check & Auto-Retry Interval (MCs):", 
+            min_value=5, 
+            max_value=200, 
+            value=int(st.session_state.get("auto_retry_interval", 25)), 
+            step=5
+        )
+        
+        if st.session_state.auto_retry_enabled:
+            st.warning("⚠️ Warning: Enabling Auto Retry will pause execution when rate limits occur to allow CarrierCheck cool-downs. It might make system slow.")
+
     b1, b2, b3, b4 = st.columns(4)
     if b1.button("🚀 Start Sequence", use_container_width=True):
         if st.session_state.current_mc != "":
@@ -494,7 +512,7 @@ if not show_admin:
         st.session_state.running = False
         st.success("Paused sequence.")
 
-    if b3.button("♻️ Retry Throttled", use_container_width=True):
+    if b3.button("♻️ Manual Retry Throttled", use_container_width=True):
         retried_count = 0
         for idx, row in enumerate(st.session_state.scraped_rows):
             c_name = str(row.get("Carrier Name", "")).upper()
@@ -516,9 +534,12 @@ if not show_admin:
         st.session_state.scraped_rows = []
         st.rerun()
 
-    # --- SCRAPING LOOP ---
+    # --- SCRAPING LOOP WITH AUTO-RETRY CHECKPOINT ---
     if st.session_state.running and st.session_state.current_mc != "":
         st_box = st.empty()
+        auto_retry = st.session_state.get("auto_retry_enabled", False)
+        interval = st.session_state.get("auto_retry_interval", 25)
+
         for _ in range(5):
             if not st.session_state.running: break
             target = str(st.session_state.current_mc)
@@ -528,7 +549,34 @@ if not show_admin:
             parsed_record = parse_carrier_data(target, raw_info)
             st.session_state.scraped_rows.append(parsed_record)
             st.session_state.current_mc += 1
-            
+
+            # Auto Retry Checkpoint: Check after every X MCs (e.g., 25)
+            total_collected = len(st.session_state.scraped_rows)
+            if auto_retry and total_collected > 0 and (total_collected % interval == 0):
+                throttled_indices = [
+                    idx for idx, r in enumerate(st.session_state.scraped_rows)
+                    if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
+                    or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
+                ]
+                
+                if throttled_indices:
+                    st_box.warning(f"🔄 Checkpoint reached ({total_collected} MCs). Auto-retrying {len(throttled_indices)} throttled record(s)...")
+                    time.sleep(3.0)  # Wait for API rate limit window to clear
+                    
+                    for count, idx in enumerate(throttled_indices, start=1):
+                        if not st.session_state.running: break
+                        retry_mc = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
+                        st_box.info(f"🔄 Auto-retrying MC-{retry_mc} ({count}/{len(throttled_indices)})...")
+                        
+                        new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
+                        new_parsed = parse_carrier_data(retry_mc, new_raw)
+                        st.session_state.scraped_rows[idx] = new_parsed
+                        time.sleep(1.0)
+                    
+                    st_box.success("✅ Auto-retry completed for current checkpoint!")
+                    time.sleep(1.0)
+
+            # Circuit breaker cool-down if current single request throttled
             if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
                 st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 3.5s...")
                 time.sleep(3.5)
