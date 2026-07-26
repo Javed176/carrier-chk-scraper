@@ -185,6 +185,7 @@ def parse_carrier_data(mc_number, raw_data):
         c.get("badge") or c.get("entity_badge") or c.get("classification") or c.get("badge_type") or ""
     ).strip().upper()
 
+    # Safety wrapper for authority status structures
     def extract_status(val):
         if isinstance(val, dict):
             return str(val.get("status") or val.get("desc") or val.get("value") or "").upper()
@@ -215,7 +216,7 @@ def parse_carrier_data(mc_number, raw_data):
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
-    # STRICT STATUS CHECK
+    # --- TOP-DOWN OPERATING STATUS CHECK ---
     if allowed_op in ["N", "NO", "FALSE"] or status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE", "SUSPENDED", "NONE"]:
         is_active = False
     elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
@@ -225,37 +226,38 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # STRICT CLASSIFICATION ENGINE
-    is_carrier_type = (
-        has_common_active or 
-        has_contract_active or 
+    # --- STRICT HIERARCHICAL CLASSIFICATION ENGINE ---
+    has_carrier_authority = has_common_active or has_contract_active
+    
+    is_carrier_by_data = (
+        has_carrier_authority or 
         "AUTHORIZED FOR HIRE" in op_class or 
         "CARRIER" in direct_badge or 
         "CARRIER" in raw_entity or 
         "MOTOR" in raw_entity or
-        "EXPRESS" in name or
-        "TRUCKING" in name or
-        "LOGISTICS" in name or
         (pu_count is not None and pu_count >= 0)
     )
 
-    is_broker_type = (
+    is_broker_by_data = (
         has_broker_active or 
         "BROKER" in direct_badge or 
         "BROKER" in raw_entity
     )
 
-    if is_broker_type and is_carrier_type:
-        if has_broker_active and (has_common_active or has_contract_active):
-            entity_label = "CARRIER / BROKER"
-        elif has_broker_active:
+    if has_carrier_authority and has_broker_active:
+        entity_label = "CARRIER / BROKER"
+    elif has_carrier_authority or "AUTHORIZED FOR HIRE" in op_class:
+        entity_label = "CARRIER"
+    elif is_broker_by_data and not is_carrier_by_data:
+        entity_label = "BROKER"
+    elif is_carrier_by_data:
+        entity_label = "CARRIER"
+    else:
+        # Fallback keyword checks only if no explicit authority signals are found
+        if "BROKER" in direct_badge or "BROKER" in raw_entity:
             entity_label = "BROKER"
         else:
             entity_label = "CARRIER"
-    elif is_broker_type:
-        entity_label = "BROKER"
-    else:
-        entity_label = "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
