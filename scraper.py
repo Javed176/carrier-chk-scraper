@@ -1,4 +1,4 @@
-import os, time, uuid, re, requests, pandas as pd
+import os, time, uuid, json, re, requests, pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -117,7 +117,8 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Operating Status": "⚠️ UNKNOWN",
             "Phone Number": "N/A",
             "Email Address": "N/A",
-            "Location": "N/A"
+            "Location": "N/A",
+            "Raw Payload": raw_data
         }
 
     if status_code in [404, 400] or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
@@ -128,7 +129,8 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Operating Status": "❌ NOT FOUND",
             "Phone Number": "N/A",
             "Email Address": "N/A",
-            "Location": "N/A"
+            "Location": "N/A",
+            "Raw Payload": raw_data
         }
 
     c = raw_data.get("carrier") or raw_data.get("data") or raw_data
@@ -140,7 +142,8 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Operating Status": "❌ NOT FOUND",
             "Phone Number": "N/A",
             "Email Address": "N/A",
-            "Location": "N/A"
+            "Location": "N/A",
+            "Raw Payload": raw_data
         }
 
     name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").strip().upper()
@@ -152,29 +155,40 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Operating Status": "❌ NOT FOUND",
             "Phone Number": "N/A",
             "Email Address": "N/A",
-            "Location": "N/A"
+            "Location": "N/A",
+            "Raw Payload": raw_data
         }
 
     # --- 1. ROBUST OPERATING STATUS DETECTION ---
+    allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
     status_raw = str(find_val_by_keys(c, [
-        "allowed_to_operate", "allowedToOperate", "operating_status", "operatingstatus", 
-        "operating_status_desc", "status", "active", "carrier_status"
+        "operating_status", "operatingstatus", "operating_status_desc", "status", "carrier_status"
     ]) or "").upper()
-
-    def is_strictly_active(val):
-        v = str(val or "").upper()
-        if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED"]:
-            return False
-        return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED", "AUTHORIZED FOR HIRE"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH", "ALLOW"])
 
     common_auth = find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority", "commonAuthority"])
     contract_auth = find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority", "contractAuthority"])
     broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
 
-    is_allowed = status_raw in ["Y", "YES", "ACTIVE", "AUTHORIZED", "ALLOWED"] or any(x in status_raw for x in ["AUTH", "ACTIVE", "ALLOW"])
-    is_auth_active = is_strictly_active(common_auth) or is_strictly_active(contract_auth) or is_strictly_active(broker_auth)
+    inactive_keywords = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELLED", "DENIED"]
+    all_status_text = f"{status_raw} {str(common_auth)} {str(contract_auth)} {str(broker_auth)}".upper()
+    has_inactive_keyword = any(kw in all_status_text for kw in inactive_keywords)
 
-    is_active = is_allowed or is_auth_active
+    is_explicitly_active = (
+        allowed_val is True or
+        str(allowed_val).upper() in ["Y", "YES", "TRUE", "1", "ACTIVE", "AUTHORIZED", "ALLOWED"] or
+        any(x in status_raw for x in ["AUTH", "ACTIVE", "ALLOW", "Y"]) or
+        str(common_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"] or
+        str(contract_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"] or
+        str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
+    )
+
+    if allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
+        is_active = False
+    elif has_inactive_keyword and not is_explicitly_active:
+        is_active = False
+    else:
+        is_active = True
+
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
     # --- 2. ROBUST BROKER VS CARRIER DETECTION ---
@@ -199,7 +213,6 @@ def parse_carrier_data(mc_number, status_code, raw_data):
     is_broker = (
         "BROKER" in entity_val or
         "BROKER" in str(broker_auth or "").upper() or
-        is_strictly_active(broker_auth) or
         any(b in name for b in ["BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", "CH ROBINSON", "TQL", "RXO", "COYOTE"])
     )
     entity_label = "BROKER" if is_broker else "CARRIER"
@@ -225,13 +238,15 @@ def parse_carrier_data(mc_number, status_code, raw_data):
         "Operating Status": status_str,
         "Phone Number": phone,
         "Email Address": email,
-        "Location": location
+        "Location": location,
+        "Raw Payload": raw_data
     }
 
 # --- STATE INIT ---
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
-                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0)]:
+                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
+                 ("reset_filters", False)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -412,22 +427,15 @@ if not show_admin:
         
         status_box.info(f"🔄 **Live Progress:** Processing **MC-{current_mc_val}**...")
 
-        # Fetch and parse single MC
         status_code, raw_info = get_carrier_info(current_mc_val, CARRIER_TOKEN)
         parsed = parse_carrier_data(current_mc_val, status_code, raw_info)
 
-        # Append result to session state
         st.session_state.scraped_rows.append(parsed)
-        
-        # Advance pointer to next MC
         st.session_state.current_mc = current_mc_val + 1
 
         log_activity(st.session_state.current_user, "search_live_single", f"Harvested MC-{current_mc_val}")
 
-        # Sleep user-configured delay speed
         time.sleep(delay_ms / 1000.0)
-        
-        # Instant rerun for real-time live UI updates
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
@@ -440,6 +448,12 @@ if not show_admin:
             base_df[col] = base_df[col].fillna("N/A").astype(str)
 
         with st.expander("🔍 Filter Collected Records", expanded=True):
+            r_col1, r_col2 = st.columns([4, 1])
+            with r_col2:
+                if st.button("🔄 Reset Filters", use_container_width=True):
+                    st.session_state.reset_filters = not st.session_state.get("reset_filters", False)
+                    st.rerun()
+
             f1, f2, f3, f4 = st.columns(4)
             sq = f1.text_input("🔎 Search Name / MC:", value="").strip().lower()
             sel_ent = f2.selectbox("🚛 Filter Entity Type:", ["ALL"] + sorted(list(base_df["Entity Type"].unique())))
@@ -458,18 +472,22 @@ if not show_admin:
 
         st.caption(f"Showing **{len(filtered_df)}** of **{len(base_df)}** total harvested records.")
 
-        tab1, tab2, tab3 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Active Only)", "📧 Raw Active Email List"])
+        if len(filtered_df) == 0 and len(base_df) > 0:
+            st.warning("⚠️ Your filters are hiding all records. Click **'🔄 Reset Filters'** above or change your filter selections to view them.")
+
+        tab1, tab2, tab3, tab4 = st.tabs(["📋 Complete Master Log", "🎯 Verified Leads (Active Only)", "📧 Raw Active Email List", "🛠️ API Raw Response Inspector"])
         
         with tab1:
-            st.dataframe(filtered_df, use_container_width=True)
-            st.download_button("📥 Export Master Sheet to CSV", filtered_df.to_csv(index=False).encode('utf-8'), "Master_MC_Log.csv", "text/csv", use_container_width=True)
+            display_df = filtered_df.drop(columns=["Raw Payload"], errors="ignore")
+            st.dataframe(display_df, use_container_width=True)
+            st.download_button("📥 Export Master Sheet to CSV", display_df.to_csv(index=False).encode('utf-8'), "Master_MC_Log.csv", "text/csv", use_container_width=True)
 
         with tab2:
             leads_df = filtered_df[
                 (filtered_df["Operating Status"].str.startswith("🟢 ACTIVE")) & 
                 (filtered_df["Email Address"].str.contains("@", na=False)) &
                 (~filtered_df["Email Address"].isin(["N/A", "Not Listed"]))
-            ]
+            ].drop(columns=["Raw Payload"], errors="ignore")
             st.dataframe(leads_df, use_container_width=True)
             st.download_button("📥 Export Clean Active Leads to CSV", leads_df.to_csv(index=False).encode('utf-8'), "Active_Leads.csv", "text/csv", use_container_width=True)
 
@@ -481,5 +499,14 @@ if not show_admin:
             ]["Email Address"].drop_duplicates()
             st.text_area("Copy Emails:", value="\n".join(emails.tolist()), height=140)
             st.download_button("📥 Export Emails CSV", pd.DataFrame({"Email Address": emails}).to_csv(index=False).encode('utf-8'), "Active_Emails.csv", "text/csv", use_container_width=True)
+
+        with tab4:
+            st.subheader("🔍 Inspect Raw CarrierChk API JSON Payload")
+            selected_mc_inspect = st.selectbox("Select MC Record to Inspect:", filtered_df["MC Number"].tolist() if not filtered_df.empty else [])
+            if selected_mc_inspect:
+                match_row = filtered_df[filtered_df["MC Number"] == selected_mc_inspect]
+                if not match_row.empty:
+                    raw_p = match_row.iloc[0].get("Raw Payload")
+                    st.json(raw_p)
     else:
         st.info("No records collected yet. Click 'Start Live Engine' to begin harvesting.")
