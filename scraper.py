@@ -1,4 +1,4 @@
-import os, time, uuid, requests, pandas as pd
+import os, time, uuid, re, requests, pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -203,7 +203,6 @@ def parse_carrier_data(mc_number, raw_data):
     elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
         is_active = True
     else:
-        # If no explicit active flag is set, require at least one active authority
         is_active = has_common_active or has_contract_active or has_broker_active
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
@@ -240,8 +239,17 @@ def parse_carrier_data(mc_number, raw_data):
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
+    # --- DEEP EMAIL EXTRACTION & REGEX FALLBACK ---
     email = str(c.get("email_address") or c.get("email") or "").strip()
-    email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else "Not Listed"
+    email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else ""
+    
+    if not email_val or email_val.lower() == "not listed":
+        emails_found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', all_payload_text)
+        valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ["carrierchk", "example.com", "domain.com", "test.com", "png", "jpg"])]
+        if valid_emails:
+            email_val = valid_emails[0]
+            
+    email_val = email_val if email_val else "Not Listed"
 
     city = str(c.get("phy_city") or c.get("city") or "").strip()
     state = str(c.get("phy_state") or c.get("state") or "").strip()
@@ -624,7 +632,6 @@ if not show_admin:
     # --- FILTERING & DISPLAY ---
     st.markdown("---")
     if st.session_state.scraped_rows:
-        # Instant Session Correction Pass for Brokers & Inactive Statuses
         major_brokers = [
             "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
             "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
