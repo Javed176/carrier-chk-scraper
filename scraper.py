@@ -159,7 +159,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. ACCURATE POSITIVE-CONFIRMATION OPERATING STATUS DETECTION ---
+    # --- 1. ROBUST MULTI-TIER OPERATING STATUS DETECTION ---
     status_raw = str(find_val_by_keys(c, [
         "status", "operating_status", "carrier_status", "authority_status", 
         "common_authority_status", "contract_authority_status", "commonStatus", "contractStatus"
@@ -169,23 +169,35 @@ def parse_carrier_data(mc_number, status_code, raw_data):
         "allowed_to_operate", "allowedToOperate", "active", "is_active", 
         "common_allowed_to_operate", "contract_allowed_to_operate"
     ])
+    allowed_str = str(allowed_val).upper().strip() if allowed_val is not None else ""
 
     inactive_keywords = [
         "INACTIVE", "REVOKED", "SUSPENDED", "CANCELED", "CANCELLED", 
         "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE", "NO AUTHORITY", "NOT ACTIVE", "I"
     ]
+    
+    active_keywords = [
+        "ACTIVE", "AUTHORIZED", "AUTH", "YES", "TRUE", "OPERATING", "COMMON", "CONTRACT", "A", "Y"
+    ]
 
     is_active = False
 
-    # Check for explicit active markers
-    if status_raw in ["ACTIVE", "AUTHORIZED", "A", "Y"] or "ACTIVE" in status_raw or "AUTHORIZED" in status_raw:
-        is_active = True
-    elif allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1", "A"]:
-        is_active = True
-    elif any(kw in status_raw for kw in inactive_keywords):
+    # Priority 1: Explicit negative flags override everything
+    if any(kw in status_raw for kw in inactive_keywords) or allowed_val is False or allowed_str in ["N", "NO", "FALSE", "0", "INACTIVE", "REVOKED"]:
         is_active = False
-    elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0", "I"]:
-        is_active = False
+    # Priority 2: Explicit positive flags
+    elif any(kw in status_raw for kw in active_keywords) or status_raw in ["A", "Y"] or allowed_val is True or allowed_str in ["Y", "YES", "TRUE", "1", "ACTIVE", "AUTHORIZED", "A"]:
+        is_active = True
+    # Priority 3: Fallback inspection on full payload text for safety/authority indicators
+    else:
+        payload_text = json.dumps(c).upper()
+        if any(term in payload_text for term in ["NOT AUTHORIZED", "REVOKED", "SUSPENDED", "INACTIVE", "OUT OF SERVICE"]):
+            is_active = False
+        elif any(term in payload_text for term in ["AUTHORIZED", "ACTIVE", "COMMON AUTHORITY", "CONTRACT AUTHORITY"]):
+            is_active = True
+        else:
+            # Default fallback if status field is completely absent or unrecognized
+            is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
