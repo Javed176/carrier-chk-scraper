@@ -83,7 +83,6 @@ def get_carrier_info(mc_number, token, retries=5):
             elif res.status_code in [404, 400]:
                 return {"not_found": True}
             elif res.status_code == 429:
-                # API Throttled: respect Retry-After header or fallback to exponential backoff sleep
                 retry_after = res.headers.get("Retry-After")
                 sleep_time = float(retry_after) if (retry_after and retry_after.isdigit()) else (3.0 * (attempt + 1))
                 time.sleep(sleep_time)
@@ -472,7 +471,7 @@ if show_admin and st.session_state.is_admin:
             st.success("Global configuration saved!")
             st.rerun()
 
-# --- MAIN STABLE SEQUENTIAL HARVESTER ENGINE ---
+# --- MAIN LIVE SEQUENTIAL HARVESTER ENGINE ---
 if not show_admin:
     st.title("🚚 Automated Carrier Harvester")
     st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
@@ -511,34 +510,42 @@ if not show_admin:
         st.session_state.scraped_rows = []
         st.rerun()
 
-    # --- STABLE SEQUENTIAL SCRAPING LOOP ---
+    # --- LIVE SEQUENTIAL SCRAPING LOOP WITH REAL-TIME PROGRESS ---
     if st.session_state.running and st.session_state.current_mc != "":
         st_box = st.empty()
+        progress_bar = st.progress(0)
         batch_size = int(st.session_state.get("target_batch_size", 25))
 
         start_mc = int(st.session_state.current_mc)
         mc_list = list(range(start_mc, start_mc + batch_size))
 
-        st_box.info(f"🔄 Running Sequential Batch: MC-{mc_list[0]} to MC-{mc_list[-1]}...")
-
         batch_results = []
-        for mc in mc_list:
+        total = len(mc_list)
+
+        for i, mc in enumerate(mc_list):
+            if not st.session_state.running:
+                break
+            
+            # Update live UI with the exact current MC being processed
+            st_box.info(f"🔄 Processing current MC: **MC-{mc}** ({i+1} of {total})")
+            progress_bar.progress((i + 1) / total)
+
             raw_info = get_carrier_info(mc, CARRIER_TOKEN)
             parsed = parse_carrier_data(mc, raw_info)
             batch_results.append(parsed)
             
-            # Apply user configured delay between requests smoothly
             time.sleep(delay_ms / 1000.0)
 
         # Append results and increment pointer
         st.session_state.scraped_rows.extend(batch_results)
-        st.session_state.current_mc = start_mc + batch_size
+        st.session_state.current_mc = start_mc + len(batch_results)
 
-        st_box.success(f"✅ Batch Complete! Logged MC-{mc_list[0]} to MC-{mc_list[-1]}.")
+        progress_bar.empty()
+        st_box.success(f"✅ Batch Complete! Processed up to MC-{st.session_state.current_mc - 1}.")
         log_activity(
             st.session_state.current_user,
             "search_batch",
-            f"Sequential batch searched MC-{mc_list[0]} to MC-{mc_list[-1]}"
+            f"Sequential batch searched MC-{start_mc} to MC-{st.session_state.current_mc - 1}"
         )
         
         time.sleep(0.5)
