@@ -159,32 +159,19 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
+    c_text = json.dumps(c).upper()
+
     # --- 1. BALANCED OPERATING STATUS DETECTION ---
     allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
-    status_raw = str(find_val_by_keys(c, [
-        "operating_status", "operatingstatus", "operating_status_desc", "status", "carrier_status"
-    ]) or "").upper()
-
-    common_auth = find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority", "commonAuthority"])
-    contract_auth = find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority", "contractAuthority"])
-    broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
-
-    inactive_keywords = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELLED", "DENIED", "NOT_AUTHORIZED"]
-    active_keywords = ["ACTIVE", "AUTHORIZED", "AUTH", "ALLOW"]
-
-    is_active = False
-    if allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
-        is_active = True
-    elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
+    inactive_terms = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELED", "CANCELLED", "DENIED", "INELIGIBLE", "NOT_AUTHORIZED"]
+    
+    if allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
         is_active = False
+    elif allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
+        is_active = True
     else:
-        all_status_text = f"{status_raw} {str(common_auth)} {str(contract_auth)} {str(broker_auth)}".upper()
-        if any(kw in all_status_text for kw in inactive_keywords):
-            is_active = False
-        elif any(kw in all_status_text for kw in active_keywords):
-            is_active = True
-        else:
-            is_active = "ACTIVE" in status_raw or "AUTH" in status_raw
+        # Default to active unless explicit negative indicators are present in the payload
+        is_active = not any(term in c_text for term in inactive_terms)
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
@@ -194,6 +181,21 @@ def parse_carrier_data(mc_number, status_code, raw_data):
         "carrier_type", "type", "authority_type"
     ]) or "").upper()
 
+    broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
+    is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
+
+    is_broker = (
+        is_broker_auth or
+        "BROKER" in entity_val or
+        "BROKER" in c_text or
+        any(b in name for b in [
+            "BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", 
+            "CH ROBINSON", "TQL", "RXO", "COYOTE", "UBER FREIGHT"
+        ])
+    )
+    entity_label = "BROKER" if is_broker else "CARRIER"
+
+    # --- 3. CONTACT INFO & LOCATION ---
     def flatten_dict_values(d):
         vals = []
         for v in d.values():
@@ -207,20 +209,6 @@ def parse_carrier_data(mc_number, status_code, raw_data):
 
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
 
-    # Explicit check for broker status in authority or entity labels
-    is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
-    is_broker = (
-        is_broker_auth or
-        "BROKER" in entity_val or
-        "BROKER" in all_payload_text or
-        any(b in name for b in [
-            "BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", 
-            "CH ROBINSON", "TQL", "RXO", "COYOTE", "UBER FREIGHT"
-        ])
-    )
-    entity_label = "BROKER" if is_broker else "CARRIER"
-
-    # --- 3. CONTACT INFO & LOCATION ---
     phone = str(find_val_by_keys(c, ["phone", "cell_phone", "telephone", "phone_number"]) or "N/A").strip()
     if phone.lower() in ["none", "null", ""]: phone = "N/A"
 
