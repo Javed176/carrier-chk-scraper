@@ -226,12 +226,21 @@ def parse_carrier_data(mc_number, raw_data):
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
     explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or c.get("type") or "").strip().upper()
 
-    major_brokers = [
-        "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
-        "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
-    ]
+    major_brokers = {
+        "CH ROBINSON": "chrobinson.com",
+        "C.H. ROBINSON": "chrobinson.com",
+        "TQL": "tql.com",
+        "TOTAL QUALITY LOGISTICS": "tql.com",
+        "RXO": "rxo.com",
+        "COYOTE LOGISTICS": "coyote.com",
+        "JB HUNT": "jbhunt.com",
+        "ECHO GLOBAL LOGISTICS": "echo.com",
+        "ECHO GLOBAL": "echo.com"
+    }
     
-    if "BROKER" in explicit_entity_type or any(b in name for b in major_brokers) or "BROKER" in all_payload_text or has_broker_active:
+    is_major_broker_matched = any(b in name for b in major_brokers.keys())
+
+    if "BROKER" in explicit_entity_type or is_major_broker_matched or "BROKER" in all_payload_text or has_broker_active:
         entity_label = "BROKER"
     else:
         entity_label = "CARRIER"
@@ -239,7 +248,7 @@ def parse_carrier_data(mc_number, raw_data):
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
-    # --- DEEP EMAIL EXTRACTION & REGEX FALLBACK ---
+    # --- DEEP EMAIL EXTRACTION & MAJOR BROKER FALLBACK ---
     email = str(c.get("email_address") or c.get("email") or "").strip()
     email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else ""
     
@@ -248,6 +257,13 @@ def parse_carrier_data(mc_number, raw_data):
         valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ["carrierchk", "example.com", "domain.com", "test.com", "png", "jpg"])]
         if valid_emails:
             email_val = valid_emails[0]
+
+    # Fallback for major brokers lacking public registry emails
+    if not email_val or email_val.lower() == "not listed":
+        for b_name, b_domain in major_brokers.items():
+            if b_name in name:
+                email_val = f"capacity@{b_domain}"
+                break
             
     email_val = email_val if email_val else "Not Listed"
 
@@ -632,13 +648,13 @@ if not show_admin:
     # --- FILTERING & DISPLAY ---
     st.markdown("---")
     if st.session_state.scraped_rows:
-        major_brokers = [
+        major_brokers_list = [
             "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
             "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
         ]
         for r in st.session_state.scraped_rows:
             c_name = str(r.get("Carrier Name", "")).upper()
-            if any(b in c_name for b in major_brokers):
+            if any(b in c_name for b in major_brokers_list):
                 r["Entity Type"] = "BROKER"
 
         base_df = pd.DataFrame(st.session_state.scraped_rows)
