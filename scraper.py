@@ -159,25 +159,32 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. BALANCED PRECISE OPERATING STATUS DETECTION ---
+    # --- 1. ACCURATE POSITIVE-CONFIRMATION OPERATING STATUS DETECTION ---
     status_raw = str(find_val_by_keys(c, [
         "status", "operating_status", "carrier_status", "authority_status", 
-        "common_authority_status", "contract_authority_status"
+        "common_authority_status", "contract_authority_status", "commonStatus", "contractStatus"
     ]) or "").upper().strip()
     
-    allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
+    allowed_val = find_val_by_keys(c, [
+        "allowed_to_operate", "allowedToOperate", "active", "is_active", 
+        "common_allowed_to_operate", "contract_allowed_to_operate"
+    ])
 
     inactive_keywords = [
         "INACTIVE", "REVOKED", "SUSPENDED", "CANCELED", "CANCELLED", 
-        "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE", "NO AUTHORITY", "NOT ACTIVE"
+        "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE", "NO AUTHORITY", "NOT ACTIVE", "I"
     ]
 
-    # Assume active by default unless an explicit inactive flag is present
-    is_active = True
+    is_active = False
 
-    if any(kw in status_raw for kw in inactive_keywords):
+    # Check for explicit active markers
+    if status_raw in ["ACTIVE", "AUTHORIZED", "A", "Y"] or "ACTIVE" in status_raw or "AUTHORIZED" in status_raw:
+        is_active = True
+    elif allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1", "A"]:
+        is_active = True
+    elif any(kw in status_raw for kw in inactive_keywords):
         is_active = False
-    elif allowed_val is not None and (allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]):
+    elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0", "I"]:
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
@@ -189,7 +196,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
     ]) or "").upper()
 
     broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
-    is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
+    is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE", "A"]
 
     c_text = json.dumps(c).upper()
     is_broker = (
