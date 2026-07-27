@@ -182,7 +182,7 @@ def parse_carrier_data(mc_number, raw_data):
         v = extract_status(val)
         if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED", "NONE ON FILE"]:
             return False
-        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED"]):
+        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED", "NOT AUTHORIZED"]):
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
@@ -227,7 +227,10 @@ def parse_carrier_data(mc_number, raw_data):
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
     explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or c.get("type") or "").strip().upper()
 
-    major_brokers = ["CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", "RXO", "COYOTE LOGISTICS", "JB HUNT"]
+    major_brokers = [
+        "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
+        "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
+    ]
     
     if "BROKER" in explicit_entity_type or any(b in name for b in major_brokers) or "BROKER" in all_payload_text or has_broker_active:
         entity_label = "BROKER"
@@ -622,7 +625,10 @@ if not show_admin:
     st.markdown("---")
     if st.session_state.scraped_rows:
         # Instant Session Correction Pass for Brokers & Inactive Statuses
-        major_brokers = ["CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", "RXO", "COYOTE LOGISTICS", "JB HUNT", "COSMOS OF LONDON"]
+        major_brokers = [
+            "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
+            "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
+        ]
         for r in st.session_state.scraped_rows:
             c_name = str(r.get("Carrier Name", "")).upper()
             if any(b in c_name for b in major_brokers):
