@@ -159,7 +159,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. ROBUST OPERATING STATUS DETECTION ---
+    # --- 1. BALANCED OPERATING STATUS DETECTION ---
     allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
     status_raw = str(find_val_by_keys(c, [
         "operating_status", "operatingstatus", "operating_status_desc", "status", "carrier_status"
@@ -169,29 +169,26 @@ def parse_carrier_data(mc_number, status_code, raw_data):
     contract_auth = find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority", "contractAuthority"])
     broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
 
-    inactive_keywords = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELLED", "DENIED"]
-    all_status_text = f"{status_raw} {str(common_auth)} {str(contract_auth)} {str(broker_auth)}".upper()
-    has_inactive_keyword = any(kw in all_status_text for kw in inactive_keywords)
+    inactive_keywords = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELLED", "DENIED", "NOT_AUTHORIZED"]
+    active_keywords = ["ACTIVE", "AUTHORIZED", "AUTH", "ALLOW"]
 
-    is_explicitly_active = (
-        allowed_val is True or
-        str(allowed_val).upper() in ["Y", "YES", "TRUE", "1", "ACTIVE", "AUTHORIZED", "ALLOWED"] or
-        any(x in status_raw for x in ["AUTH", "ACTIVE", "ALLOW", "Y"]) or
-        str(common_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"] or
-        str(contract_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"] or
-        str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
-    )
-
-    if allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
-        is_active = False
-    elif has_inactive_keyword and not is_explicitly_active:
+    is_active = False
+    if allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
+        is_active = True
+    elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
         is_active = False
     else:
-        is_active = True
+        all_status_text = f"{status_raw} {str(common_auth)} {str(contract_auth)} {str(broker_auth)}".upper()
+        if any(kw in all_status_text for kw in inactive_keywords):
+            is_active = False
+        elif any(kw in all_status_text for kw in active_keywords):
+            is_active = True
+        else:
+            is_active = "ACTIVE" in status_raw or "AUTH" in status_raw
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- 2. ROBUST BROKER VS CARRIER DETECTION ---
+    # --- 2. ACCURATE BROKER VS CARRIER DETECTION ---
     entity_val = str(find_val_by_keys(c, [
         "entity_type", "entitytype", "operating_type", "operatingtype", 
         "carrier_type", "type", "authority_type"
@@ -210,10 +207,16 @@ def parse_carrier_data(mc_number, status_code, raw_data):
 
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
 
+    # Explicit check for broker status in authority or entity labels
+    is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
     is_broker = (
+        is_broker_auth or
         "BROKER" in entity_val or
-        "BROKER" in str(broker_auth or "").upper() or
-        any(b in name for b in ["BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", "CH ROBINSON", "TQL", "RXO", "COYOTE"])
+        "BROKER" in all_payload_text or
+        any(b in name for b in [
+            "BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", 
+            "CH ROBINSON", "TQL", "RXO", "COYOTE", "UBER FREIGHT"
+        ])
     )
     entity_label = "BROKER" if is_broker else "CARRIER"
 
