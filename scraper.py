@@ -1,4 +1,4 @@
-import os, time, uuid, re, requests, pandas as pd
+import os, time, uuid, re, requests, threading, queue, pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -70,39 +70,17 @@ def get_user_settings(email):
         pass
     return 500.0, 3.0
 
-# --- ROBUST SEQUENTIAL API CALLER WITH THROTTLE SLEEP ---
-def get_carrier_info(mc_number, token, retries=5):
+# --- API CALLER & PARSER ---
+def call_api(mc_number, token):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
-    
-    for attempt in range(retries):
-        try:
-            res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
-            
-            if res.status_code == 200:
-                return res.json()
-            elif res.status_code in [404, 400]:
-                return {"not_found": True}
-            elif res.status_code == 429:
-                retry_after = res.headers.get("Retry-After")
-                sleep_time = float(retry_after) if (retry_after and retry_after.isdigit()) else (3.0 * (attempt + 1))
-                time.sleep(sleep_time)
-                continue
-            elif res.status_code in [500, 502, 503, 504]:
-                if attempt < retries - 1:
-                    time.sleep(2.0 * (attempt + 1))
-                    continue
-                return {"inactive_timeout": True}
-            else:
-                if attempt < retries - 1:
-                    time.sleep(1.5 * (attempt + 1))
-        except (requests.exceptions.Timeout, requests.exceptions.RequestException):
-            if attempt < retries - 1:
-                time.sleep(2.0 * (attempt + 1))
-                
-    return "API_ERROR"
+    try:
+        res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
+        return res.status_code, res.headers, res.json() if res.status_code == 200 else res.text
+    except Exception:
+        return 500, {}, "ERROR"
 
-def parse_carrier_data(mc_number, raw_data):
-    if raw_data == "API_ERROR":
+def parse_carrier_data(mc_number, status_code, raw_data):
+    if status_code == 429:
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "⚠️ API THROTTLED",
@@ -111,20 +89,9 @@ def parse_carrier_data(mc_number, raw_data):
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }
+        }, True # Flag as throttled
 
-    if isinstance(raw_data, dict) and raw_data.get("inactive_timeout") is True:
-        return {
-            "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "INACTIVE / REVOKED DOCKET",
-            "Entity Type": "N/A",
-            "Operating Status": "🔴 INACTIVE",
-            "Phone Number": "N/A",
-            "Email Address": "N/A",
-            "Location": "N/A"
-        }
-
-    if not raw_data or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
+    if status_code in [404, 400] or raw_data == "ERROR":
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND",
@@ -133,31 +100,9 @@ def parse_carrier_data(mc_number, raw_data):
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }
+        }, False
 
-    if raw_data.get("error") or raw_data.get("message") == "Not Found":
-        return {
-            "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "DOCKET NOT FOUND",
-            "Entity Type": "N/A",
-            "Operating Status": "❌ NOT FOUND",
-            "Phone Number": "N/A",
-            "Email Address": "N/A",
-            "Location": "N/A"
-        }
-
-    c = raw_data.get("carrier") or raw_data.get("data") or raw_data
-    if not isinstance(c, dict) or not c:
-        return {
-            "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "DOCKET NOT FOUND",
-            "Entity Type": "N/A",
-            "Operating Status": "❌ NOT FOUND",
-            "Phone Number": "N/A",
-            "Email Address": "N/A",
-            "Location": "N/A"
-        }
-
+    c = raw_data.get("carrier") or raw_data.get("data") or raw_data if isinstance(raw_data, dict) else {}
     name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").strip().upper()
     if name in ["NONE", "NULL", "", "N/A", "NOT FOUND"]:
         return {
@@ -168,7 +113,7 @@ def parse_carrier_data(mc_number, raw_data):
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }
+        }, False
 
     def extract_status(val):
         if isinstance(val, dict):
@@ -177,88 +122,43 @@ def parse_carrier_data(mc_number, raw_data):
 
     def is_strictly_active(val):
         v = extract_status(val)
-        if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED", "NONE ON FILE"]:
-            return False
-        if any(neg in v for neg in ["INACTIVE", "REVOKED", "DISCONTINUED", "NONE", "NO", "FALSE", "DENIED", "NOT AUTHORIZED"]):
+        if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED"]:
             return False
         return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
 
-    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or c.get("common_status")
-    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status") or c.get("brokerAuth")
+    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
+    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
+    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
 
-    has_common_active = is_strictly_active(common_auth)
-    has_contract_active = is_strictly_active(contract_auth)
-    has_broker_active = is_strictly_active(broker_auth)
-
-    allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
-    status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
-
-    if allowed_op in ["N", "NO", "FALSE"] or status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE", "SUSPENDED", "NONE"]:
-        is_active = False
-    elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
-        is_active = True
-    else:
-        is_active = has_common_active or has_contract_active or has_broker_active
-
+    is_active = is_strictly_active(common_auth) or is_strictly_active(contract_auth) or is_strictly_active(broker_auth)
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
     def flatten_dict_values(d):
         vals = []
         for v in d.values():
-            if isinstance(v, dict):
-                vals.extend(flatten_dict_values(v))
+            if isinstance(v, dict): vals.extend(flatten_dict_values(v))
             elif isinstance(v, list):
                 for item in v:
-                    if isinstance(item, dict):
-                        vals.extend(flatten_dict_values(item))
-                    else:
-                        vals.append(str(item))
-            else:
-                vals.append(str(v))
+                    if isinstance(item, dict): vals.extend(flatten_dict_values(item))
+                    else: vals.append(str(item))
+            else: vals.append(str(v))
         return vals
 
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
-    explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or c.get("type") or "").strip().upper()
-
-    major_brokers = {
-        "CH ROBINSON": "chrobinson.com",
-        "C.H. ROBINSON": "chrobinson.com",
-        "TQL": "tql.com",
-        "TOTAL QUALITY LOGISTICS": "tql.com",
-        "RXO": "rxo.com",
-        "COYOTE LOGISTICS": "coyote.com",
-        "JB HUNT": "jbhunt.com",
-        "ECHO GLOBAL LOGISTICS": "echo.com",
-        "ECHO GLOBAL": "echo.com"
-    }
+    explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or "").strip().upper()
     
-    is_major_broker_matched = any(b in name for b in major_brokers.keys())
-
-    if "BROKER" in explicit_entity_type or is_major_broker_matched or "BROKER" in all_payload_text or has_broker_active:
-        entity_label = "BROKER"
-    else:
-        entity_label = "CARRIER"
+    major_brokers = {"CH ROBINSON": "chrobinson.com", "TQL": "tql.com", "RXO": "rxo.com", "COYOTE LOGISTICS": "coyote.com", "JB HUNT": "jbhunt.com"}
+    is_broker = "BROKER" in explicit_entity_type or any(b in name for b in major_brokers) or is_strictly_active(broker_auth)
+    entity_label = "BROKER" if is_broker else "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
     email = str(c.get("email_address") or c.get("email") or "").strip()
-    email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else ""
-    
-    if not email_val or email_val.lower() == "not listed":
+    if not email or email.lower() in ["none", "null", "not listed", ""]:
         emails_found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', all_payload_text)
-        valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ["carrierchk", "example.com", "domain.com", "test.com", "png", "jpg"])]
-        if valid_emails:
-            email_val = valid_emails[0]
-
-    if not email_val or email_val.lower() == "not listed":
-        for b_name, b_domain in major_brokers.items():
-            if b_name in name:
-                email_val = f"capacity@{b_domain}"
-                break
-            
-    email_val = email_val if email_val else "Not Listed"
+        valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ["carrierchk", "example.com"])]
+        email = valid_emails[0] if valid_emails else "Not Listed"
 
     city = str(c.get("phy_city") or c.get("city") or "").strip()
     state = str(c.get("phy_state") or c.get("state") or "").strip()
@@ -270,15 +170,15 @@ def parse_carrier_data(mc_number, raw_data):
         "Entity Type": entity_label,
         "Operating Status": status_str,
         "Phone Number": phone,
-        "Email Address": email_val,
+        "Email Address": email,
         "Location": location
-    }
+    }, False
 
 # --- STATE INIT ---
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
                  ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
-                 ("target_batch_size", 25)]:
+                 ("thread_status", "Idle"), ("active_mc_normal", "None"), ("active_mc_throttle", "None")]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -393,176 +293,141 @@ if show_admin and st.session_state.is_admin:
         
         if st.button("➕ Add User Account", use_container_width=True) and u_email and u_pass:
             supabase.table("users").insert({
-                "email": u_email, 
-                "password": u_pass, 
-                "is_admin": (u_role == "Super Admin"), 
-                "delay_ms": u_delay, 
-                "session_duration_hours": u_hrs
+                "email": u_email, "password": u_pass, "is_admin": (u_role == "Super Admin"), 
+                "delay_ms": u_delay, "session_duration_hours": u_hrs
             }).execute()
             st.success(f"Registered new account for {u_email}!")
             st.rerun()
 
         st.markdown("---")
-        st.subheader("✏️ Edit Account Settings & Passwords")
+        st.subheader("📋 Registered Users Overview")
         user_list = supabase.table("users").select("*").execute().data
-        
         if user_list:
-            user_emails = [u["email"] for u in user_list]
-            target_email = st.selectbox("Choose Account to Modify:", user_emails)
-            target_user = next((u for u in user_list if u["email"] == target_email), None)
-            
-            if target_user:
-                col_e1, col_e2, col_e3 = st.columns(3)
-                e_pass = col_e1.text_input("Change Password:", value=str(target_user.get("password", "")))
-                e_hrs = col_e2.number_input("Session Lockout Timeout (Hours):", min_value=0.1, max_value=24.0, value=float(target_user.get("session_duration_hours", 3.0)), step=0.5)
-                e_delay = col_e3.number_input("Speed Limit (ms):", min_value=1.0, value=float(target_user.get("delay_ms", 500.0)), step=10.0)
-                
-                if st.button("💾 Apply Account Updates", use_container_width=True):
-                    supabase.table("users").update({
-                        "password": e_pass,
-                        "session_duration_hours": float(e_hrs),
-                        "delay_ms": float(e_delay)
-                    }).eq("email", target_email).execute()
-                    st.success(f"Successfully updated credentials and timeouts for {target_email}!")
-                    st.session_state.last_db_check = 0.0
-                    time.sleep(1)
-                    st.rerun()
-
-            st.markdown("---")
-            st.subheader("📋 Registered Users Overview")
-            st.dataframe(pd.DataFrame(user_list)[["email", "is_admin", "password", "delay_ms", "session_duration_hours"]], use_container_width=True)
-            
-            st.subheader("🗑️ Delete Account")
-            del_email = st.selectbox("Select Account to Delete:", [u for u in user_emails if u != st.session_state.current_user])
-            if st.button("Delete Account", type="primary"):
-                supabase.table("users").delete().eq("email", del_email).execute()
-                st.success(f"Deleted {del_email}.")
-                st.rerun()
+            st.dataframe(pd.DataFrame(user_list)[["email", "is_admin", "delay_ms", "session_duration_hours"]], use_container_width=True)
 
     with t2:
         st.subheader("📊 Target User Activity History")
-        logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(500).execute().data
-        
+        logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(200).execute().data
         if logs:
             logs_df = pd.DataFrame(logs)
-            logs_df["Time & Date"] = pd.to_datetime(logs_df["created_at"]).dt.strftime('%Y-%m-%d %I:%M:%S %p')
-            
-            log_users = ["ALL Users"] + sorted([str(u) for u in logs_df["email"].unique() if u])
-            selected_log_user = st.selectbox("🔍 Filter Activity History by User:", log_users)
-            
-            display_logs = logs_df[logs_df["email"] == selected_log_user] if selected_log_user != "ALL Users" else logs_df
-
-            st.caption(f"Showing **{len(display_logs)}** log records.")
-            st.dataframe(display_logs[["Time & Date", "email", "action", "detail"]].rename(columns={
-                "email": "User Email",
-                "action": "Action",
-                "detail": "Details"
-            }), use_container_width=True)
-        else:
-            st.info("No activity logs found.")
+            st.dataframe(logs_df[["created_at", "email", "action", "detail"]], use_container_width=True)
 
     with t3:
         st.subheader("⚙️ Global Speed Overrides")
         cfg = get_system_config()
-        over = st.checkbox("Global Speed Override (Applies to all users)", value=cfg["override_global_speed"])
+        over = st.checkbox("Global Speed Override", value=cfg["override_global_speed"])
         g_speed = st.number_input("Global Delay (ms):", value=cfg["throttle_delay_ms"])
         if st.button("💾 Save Global Settings"):
             update_global_config(g_speed, over)
-            st.success("Global configuration saved!")
+            st.success("Saved!")
             st.rerun()
 
-# --- MAIN LIVE SEQUENTIAL HARVESTER ENGINE ---
+# --- MAIN TWO-THREAD HARVESTER ENGINE ---
 if not show_admin:
-    st.title("🚚 Automated Carrier Harvester")
+    st.title("🚚 Automated Carrier Harvester (Dual-Thread Engine)")
     st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
 
     c1, c2 = st.columns(2)
     with c1:
         if st.session_state.current_mc == "":
-            raw_mc = st.text_input("Starting MC Number:", placeholder="e.g. 1066434")
+            raw_mc = st.text_input("Starting MC Number:", placeholder="e.g. 1800000")
             if raw_mc.isdigit(): st.session_state.current_mc = int(raw_mc)
         else:
             st.session_state.current_mc = st.number_input("Set MC Number:", min_value=1, value=int(st.session_state.current_mc), step=1)
     with c2:
         st.metric("Session Speed Enforced", speed_str)
 
-    with st.expander("⚙️ Batch Configuration", expanded=True):
-        st.session_state.target_batch_size = st.number_input(
-            "Batch Size (Total MCs Per Cycle):", 
-            min_value=1, 
-            max_value=500, 
-            value=int(st.session_state.get("target_batch_size", 25)), 
-            step=5
-        )
-
     b1, b2, b3 = st.columns(3)
-    if b1.button("🚀 Start Sequence", use_container_width=True):
+    if b1.button("🚀 Start Live Engine", use_container_width=True):
         if st.session_state.current_mc != "":
             st.session_state.running = True
             st.rerun()
         else: st.error("Enter MC Number first.")
 
-    if b2.button("🛑 STOP Sequence", use_container_width=True):
+    if b2.button("🛑 STOP Engine", use_container_width=True):
         st.session_state.running = False
-        st.success("Paused sequence.")
+        st.success("Stopped harvesting engine.")
 
     if b3.button("🗑️ Clear Data", use_container_width=True):
         st.session_state.scraped_rows = []
         st.rerun()
 
-    # --- LIVE SEQUENTIAL SCRAPING LOOP WITH REAL-TIME PROGRESS ---
-    if st.session_state.running and st.session_state.current_mc != "":
-        st_box = st.empty()
-        progress_bar = st.progress(0)
-        batch_size = int(st.session_state.get("target_batch_size", 25))
+    # --- DUAL-THREAD QUEUE SETUP ---
+    if "q_normal" not in st.session_state: st.session_state.q_normal = queue.Queue()
+    if "q_throttle" not in st.session_state: st.session_state.q_throttle = queue.Queue()
+    if "data_lock" not in st.session_state: st.session_state.data_lock = threading.Lock()
 
-        start_mc = int(st.session_state.current_mc)
-        mc_list = list(range(start_mc, start_mc + batch_size))
+    status_box = st.empty()
 
-        batch_results = []
-        total = len(mc_list)
-
-        for i, mc in enumerate(mc_list):
-            if not st.session_state.running:
-                break
+    # Background Workers
+    def normal_worker():
+        while st.session_state.running:
+            try:
+                mc = st.session_state.q_normal.get(timeout=0.5)
+            except queue.Empty:
+                continue
             
-            # Update live UI with the exact current MC being processed
-            st_box.info(f"🔄 Processing current MC: **MC-{mc}** ({i+1} of {total})")
-            progress_bar.progress((i + 1) / total)
+            st.session_state.active_mc_normal = f"MC-{mc}"
+            code, headers, raw = call_api(mc, CARRIER_TOKEN)
+            parsed, is_throttled = parse_carrier_data(mc, code, raw)
 
-            raw_info = get_carrier_info(mc, CARRIER_TOKEN)
-            parsed = parse_carrier_data(mc, raw_info)
-            batch_results.append(parsed)
+            if is_throttled:
+                # Hand off immediately to Thread 2 (Throttle/Sleep Worker)
+                st.session_state.q_throttle.put(mc)
+            else:
+                with st.session_state.data_lock:
+                    st.session_state.scraped_rows.append(parsed)
+                time.sleep(delay_ms / 1000.0)
             
-            time.sleep(delay_ms / 1000.0)
+            # Queue next sequential MC
+            if st.session_state.running:
+                st.session_state.current_mc = mc + 1
+                st.session_state.q_normal.put(mc + 1)
+            st.session_state.q_normal.task_done()
 
-        # Append results and increment pointer
-        st.session_state.scraped_rows.extend(batch_results)
-        st.session_state.current_mc = start_mc + len(batch_results)
+    def throttle_worker():
+        while st.session_state.running:
+            try:
+                mc = st.session_state.q_throttle.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            
+            st.session_state.active_mc_throttle = f"MC-{mc} (Throttled - Sleeping)"
+            
+            # Sleep & Backoff specifically for throttled requests
+            backoff_sleep = 4.0
+            time.sleep(backoff_sleep)
+            
+            code, headers, raw = call_api(mc, CARRIER_TOKEN)
+            parsed, is_throttled = parse_carrier_data(mc, code, raw)
 
-        progress_bar.empty()
-        st_box.success(f"✅ Batch Complete! Processed up to MC-{st.session_state.current_mc - 1}.")
-        log_activity(
-            st.session_state.current_user,
-            "search_batch",
-            f"Sequential batch searched MC-{start_mc} to MC-{st.session_state.current_mc - 1}"
-        )
-        
-        time.sleep(0.5)
+            if is_throttled:
+                # Put back in throttle queue if still rate limited
+                st.session_state.q_throttle.put(mc)
+            else:
+                with st.session_state.data_lock:
+                    st.session_state.scraped_rows.append(parsed)
+                st.session_state.active_mc_throttle = "Idle / Cleared"
+            
+            st.session_state.q_throttle.task_done()
+
+    # Start threads if running
+    if st.session_state.running:
+        if st.session_state.q_normal.empty() and st.session_state.q_throttle.empty():
+            st.session_state.q_normal.put(int(st.session_state.current_mc))
+            
+            t_normal = threading.Thread(target=normal_worker, daemon=True)
+            t_throttle = threading.Thread(target=throttle_worker, daemon=True)
+            t_normal.start()
+            t_throttle.start()
+
+        status_box.info(f"⚡ **Thread 1 (Normal):** Processing `{st.session_state.active_mc_normal}` | 🛑 **Thread 2 (Throttle/Sleep):** `{st.session_state.active_mc_throttle}`")
+        time.sleep(1.0)
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
     st.markdown("---")
     if st.session_state.scraped_rows:
-        major_brokers_list = [
-            "CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", 
-            "RXO", "COYOTE LOGISTICS", "JB HUNT", "ECHO GLOBAL LOGISTICS", "ECHO GLOBAL"
-        ]
-        for r in st.session_state.scraped_rows:
-            c_name = str(r.get("Carrier Name", "")).upper()
-            if any(b in c_name for b in major_brokers_list):
-                r["Entity Type"] = "BROKER"
-
         base_df = pd.DataFrame(st.session_state.scraped_rows)
 
         for col in ["Entity Type", "Operating Status", "Carrier Name", "MC Number", "Location", "Email Address"]:
@@ -572,19 +437,9 @@ if not show_admin:
         with st.expander("🔍 Filter Collected Records", expanded=True):
             f1, f2, f3, f4 = st.columns(4)
             sq = f1.text_input("🔎 Search Name / MC:", value="").strip().lower()
-            
-            raw_ent = [e for e in base_df["Entity Type"].unique() if e not in ["N/A", "nan", "None", ""]]
-            sel_ent = f2.selectbox("🚛 Filter Entity Type:", ["ALL"] + sorted(list(set(raw_ent))))
-
-            raw_stat = [s for s in base_df["Operating Status"].unique() if s not in ["N/A", "nan", "None", ""]]
-            sel_stat = f3.selectbox("📌 Filter Status:", ["ALL"] + sorted(list(set(raw_stat))))
-
-            states = set(ALL_US_STATES)
-            for loc in base_df["Location"]:
-                if "," in loc:
-                    st_code = loc.split(",")[-1].strip().upper()
-                    if len(st_code) == 2: states.add(st_code)
-            sel_state = f4.selectbox("📍 Filter State:", ["ALL"] + sorted(list(states)))
+            sel_ent = f2.selectbox("🚛 Filter Entity Type:", ["ALL"] + sorted(list(base_df["Entity Type"].unique())))
+            sel_stat = f3.selectbox("📌 Filter Status:", ["ALL"] + sorted(list(base_df["Operating Status"].unique())))
+            sel_state = f4.selectbox("📍 Filter State:", ["ALL"] + sorted(list(ALL_US_STATES)))
 
         filtered_df = base_df.copy()
         if sq:
@@ -610,11 +465,8 @@ if not show_admin:
                 (filtered_df["Email Address"].str.contains("@", na=False)) &
                 (~filtered_df["Email Address"].isin(["N/A", "Not Listed"]))
             ]
-            if not leads_df.empty:
-                st.dataframe(leads_df, use_container_width=True)
-                st.download_button("📥 Export Clean Active Leads to CSV", leads_df.to_csv(index=False).encode('utf-8'), "Active_Leads.csv", "text/csv", use_container_width=True)
-            else:
-                st.info("No active leads matching current filters.")
+            st.dataframe(leads_df, use_container_width=True)
+            st.download_button("📥 Export Clean Active Leads to CSV", leads_df.to_csv(index=False).encode('utf-8'), "Active_Leads.csv", "text/csv", use_container_width=True)
 
         with tab3:
             emails = filtered_df[
@@ -622,12 +474,7 @@ if not show_admin:
                 (filtered_df["Email Address"].str.contains("@", na=False)) &
                 (~filtered_df["Email Address"].isin(["N/A", "Not Listed"]))
             ]["Email Address"].drop_duplicates()
-            if not emails.empty:
-                edf = pd.DataFrame({"Email Address": emails})
-                st.dataframe(edf, use_container_width=True)
-                st.text_area("Copy Emails:", value="\n".join(emails.tolist()), height=140)
-                st.download_button("📥 Export Emails CSV", edf.to_csv(index=False).encode('utf-8'), "Active_Emails.csv", "text/csv", use_container_width=True)
-            else:
-                st.info("No active emails matching current filters.")
+            st.text_area("Copy Emails:", value="\n".join(emails.tolist()), height=140)
+            st.download_button("📥 Export Emails CSV", pd.DataFrame({"Email Address": emails}).to_csv(index=False).encode('utf-8'), "Active_Emails.csv", "text/csv", use_container_width=True)
     else:
-        st.info("No records collected yet. Click 'Start Sequence' to begin harvesting.")
+        st.info("No records collected yet. Click 'Start Live Engine' to begin harvesting.")
