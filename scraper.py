@@ -207,32 +207,29 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- ACCURATE ENTITY CLASSIFICATION ENGINE (EXPANDED TO CATCH BROKERS) ---
-    raw_is_broker = str(c.get("is_broker") or c.get("isBroker") or "").strip().upper()
-    bool_broker = raw_is_broker in ["TRUE", "Y", "YES", "1"]
-    
-    entity_keys = ["entity_type", "entity_type_desc", "entityType", "type", "company_type", "role", "classification", "badge", "badge_type", "carrier_type"]
-    entity_values = [str(c.get(k, "")).upper() for k in entity_keys if c.get(k)]
-    
-    op_class = str(
-        c.get("operation_classification") or c.get("carrier_operation") or c.get("operationClass") or c.get("operation_class") or ""
-    ).strip().upper()
-    if op_class:
-        entity_values.append(op_class)
+    # --- BULLETPROOF CLASSIFICATION ENGINE (DEEP JSON VALUE SCAN) ---
+    # Gather all values from the payload dictionary to see if "BROKER" is present anywhere
+    def flatten_dict_values(d):
+        vals = []
+        for v in d.values():
+            if isinstance(v, dict):
+                vals.extend(flatten_dict_values(v))
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        vals.extend(flatten_dict_values(item))
+                    else:
+                        vals.append(str(item))
+            else:
+                vals.append(str(v))
+        return vals
 
-    is_explicit_broker = bool_broker or any("BROKER" in val or val == "B" for val in entity_values)
-    is_explicit_carrier = any(term in val for val in entity_values for term in ["CARRIER", "MOTOR", "COMMON", "CONTRACT"])
+    all_payload_text = " ".join(flatten_dict_values(c)).upper()
 
-    if has_broker_active or is_explicit_broker:
+    if "BROKER" in all_payload_text or has_broker_active:
         entity_label = "BROKER"
-    elif is_explicit_carrier or has_common_active or has_contract_active:
-        entity_label = "CARRIER"
     else:
-        # Final Fallback check on name keywords (excluding broad terms like Logistics)
-        if any(term in name for term in ["BROKER", "PROPERTY BROKER"]):
-            entity_label = "BROKER"
-        else:
-            entity_label = "CARRIER"
+        entity_label = "CARRIER"
 
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
