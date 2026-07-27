@@ -1,5 +1,4 @@
 import os, time, uuid, re, requests, pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -71,7 +70,7 @@ def get_user_settings(email):
         pass
     return 500.0, 3.0
 
-# --- ANTI-THROTTLE PARALLEL API CALLER ---
+# --- ROBUST SEQUENTIAL API CALLER WITH THROTTLE SLEEP ---
 def get_carrier_info(mc_number, token, retries=5):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     
@@ -80,16 +79,14 @@ def get_carrier_info(mc_number, token, retries=5):
             res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
             
             if res.status_code == 200:
-                data = res.json()
-                return data
+                return res.json()
             elif res.status_code in [404, 400]:
                 return {"not_found": True}
             elif res.status_code == 429:
+                # API Throttled: respect Retry-After header or fallback to exponential backoff sleep
                 retry_after = res.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
-                    time.sleep(float(retry_after))
-                else:
-                    time.sleep(2.0 * (attempt + 1))
+                sleep_time = float(retry_after) if (retry_after and retry_after.isdigit()) else (3.0 * (attempt + 1))
+                time.sleep(sleep_time)
                 continue
             elif res.status_code in [500, 502, 503, 504]:
                 if attempt < retries - 1:
@@ -282,7 +279,7 @@ def parse_carrier_data(mc_number, raw_data):
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
                  ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
-                 ("target_batch_size", 25), ("parallel_workers", 5)]:
+                 ("target_batch_size", 25)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -475,9 +472,9 @@ if show_admin and st.session_state.is_admin:
             st.success("Global configuration saved!")
             st.rerun()
 
-# --- MAIN PARALLEL HARVESTER ENGINE ---
+# --- MAIN STABLE SEQUENTIAL HARVESTER ENGINE ---
 if not show_admin:
-    st.title("🚚 Automated Parallel Carrier Harvester")
+    st.title("🚚 Automated Carrier Harvester")
     st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
 
     c1, c2 = st.columns(2)
@@ -490,25 +487,17 @@ if not show_admin:
     with c2:
         st.metric("Session Speed Enforced", speed_str)
 
-    with st.expander("⚙️ Parallel Concurrency & Batch Configuration", expanded=True):
-        c_col1, c_col2 = st.columns(2)
-        st.session_state.target_batch_size = c_col1.number_input(
+    with st.expander("⚙️ Batch Configuration", expanded=True):
+        st.session_state.target_batch_size = st.number_input(
             "Batch Size (Total MCs Per Cycle):", 
             min_value=1, 
             max_value=500, 
             value=int(st.session_state.get("target_batch_size", 25)), 
             step=5
         )
-        st.session_state.parallel_workers = c_col2.number_input(
-            "Parallel Workers (Concurrent Threads):", 
-            min_value=1, 
-            max_value=20, 
-            value=int(st.session_state.get("parallel_workers", 5)), 
-            step=1
-        )
 
     b1, b2, b3 = st.columns(3)
-    if b1.button("🚀 Start Parallel Sequence", use_container_width=True):
+    if b1.button("🚀 Start Sequence", use_container_width=True):
         if st.session_state.current_mc != "":
             st.session_state.running = True
             st.rerun()
@@ -522,48 +511,34 @@ if not show_admin:
         st.session_state.scraped_rows = []
         st.rerun()
 
-    # --- MULTI-THREADED PARALLEL SCRAPING LOOP ---
+    # --- STABLE SEQUENTIAL SCRAPING LOOP ---
     if st.session_state.running and st.session_state.current_mc != "":
         st_box = st.empty()
         batch_size = int(st.session_state.get("target_batch_size", 25))
-        max_workers = int(st.session_state.get("parallel_workers", 5))
 
         start_mc = int(st.session_state.current_mc)
         mc_list = list(range(start_mc, start_mc + batch_size))
 
-        st_box.info(f"⚡ Running Parallel Batch: MC-{mc_list[0]} to MC-{mc_list[-1]} using {max_workers} concurrent threads...")
+        st_box.info(f"🔄 Running Sequential Batch: MC-{mc_list[0]} to MC-{mc_list[-1]}...")
 
         batch_results = []
-
-        def worker_fetch(mc):
+        for mc in mc_list:
             raw_info = get_carrier_info(mc, CARRIER_TOKEN)
-            # If throttled, thread self-heals independently in background without stopping others
-            retry_count = 0
-            while raw_info == "API_ERROR" and retry_count < 3:
-                retry_count += 1
-                time.sleep(1.5 * retry_count)
-                raw_info = get_carrier_info(mc, CARRIER_TOKEN)
-            return parse_carrier_data(mc, raw_info)
-
-        # Execute threads in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_mc = {executor.submit(worker_fetch, mc): mc for mc in mc_list}
-            for future in as_completed(future_to_mc):
-                try:
-                    res = future.result()
-                    batch_results.append(res)
-                except Exception:
-                    pass
+            parsed = parse_carrier_data(mc, raw_info)
+            batch_results.append(parsed)
+            
+            # Apply user configured delay between requests smoothly
+            time.sleep(delay_ms / 1000.0)
 
         # Append results and increment pointer
         st.session_state.scraped_rows.extend(batch_results)
         st.session_state.current_mc = start_mc + batch_size
 
-        st_box.success(f"✅ Parallel Batch Complete! Logged MC-{mc_list[0]} to MC-{mc_list[-1]}.")
+        st_box.success(f"✅ Batch Complete! Logged MC-{mc_list[0]} to MC-{mc_list[-1]}.")
         log_activity(
             st.session_state.current_user,
             "search_batch",
-            f"Parallel batch searched MC-{mc_list[0]} to MC-{mc_list[-1]}"
+            f"Sequential batch searched MC-{mc_list[0]} to MC-{mc_list[-1]}"
         )
         
         time.sleep(0.5)
@@ -648,4 +623,4 @@ if not show_admin:
             else:
                 st.info("No active emails matching current filters.")
     else:
-        st.info("No records collected yet. Click 'Start Parallel Sequence' to begin harvesting.")
+        st.info("No records collected yet. Click 'Start Sequence' to begin harvesting.")
