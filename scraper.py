@@ -173,18 +173,6 @@ def parse_carrier_data(mc_number, raw_data):
             "Location": "N/A"
         }
 
-    raw_entity = str(
-        c.get("entity_type") or c.get("entity_type_desc") or c.get("entityType") or c.get("type") or ""
-    ).strip().upper()
-
-    op_class = str(
-        c.get("operation_classification") or c.get("carrier_operation") or c.get("operationClass") or c.get("operation_class") or ""
-    ).strip().upper()
-
-    direct_badge = str(
-        c.get("badge") or c.get("entity_badge") or c.get("classification") or c.get("badge_type") or ""
-    ).strip().upper()
-
     def extract_status(val):
         if isinstance(val, dict):
             return str(val.get("status") or val.get("desc") or val.get("value") or "").upper()
@@ -200,7 +188,7 @@ def parse_carrier_data(mc_number, raw_data):
 
     common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority") or c.get("common_status")
     contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority") or c.get("contract_status")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status")
+    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority") or c.get("broker_status") or c.get("brokerAuth")
 
     has_common_active = is_strictly_active(common_auth)
     has_contract_active = is_strictly_active(contract_auth)
@@ -219,16 +207,28 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- ACCURATE ENTITY CLASSIFICATION ENGINE ---
-    is_explicit_broker = any(term in direct_badge or term in raw_entity or term in op_class for term in ["BROKER", "PROPERTY BROKER"])
-    is_explicit_carrier = any(term in direct_badge or term in raw_entity or term in op_class for term in ["CARRIER", "MOTOR", "COMMON", "CONTRACT"])
+    # --- ACCURATE ENTITY CLASSIFICATION ENGINE (EXPANDED TO CATCH BROKERS) ---
+    raw_is_broker = str(c.get("is_broker") or c.get("isBroker") or "").strip().upper()
+    bool_broker = raw_is_broker in ["TRUE", "Y", "YES", "1"]
+    
+    entity_keys = ["entity_type", "entity_type_desc", "entityType", "type", "company_type", "role", "classification", "badge", "badge_type", "carrier_type"]
+    entity_values = [str(c.get(k, "")).upper() for k in entity_keys if c.get(k)]
+    
+    op_class = str(
+        c.get("operation_classification") or c.get("carrier_operation") or c.get("operationClass") or c.get("operation_class") or ""
+    ).strip().upper()
+    if op_class:
+        entity_values.append(op_class)
+
+    is_explicit_broker = bool_broker or any("BROKER" in val or val == "B" for val in entity_values)
+    is_explicit_carrier = any(term in val for val in entity_values for term in ["CARRIER", "MOTOR", "COMMON", "CONTRACT"])
 
     if has_broker_active or is_explicit_broker:
         entity_label = "BROKER"
     elif is_explicit_carrier or has_common_active or has_contract_active:
         entity_label = "CARRIER"
     else:
-        # Fallback check on name keywords (excluding generic words like logistics which apply to carriers)
+        # Final Fallback check on name keywords (excluding broad terms like Logistics)
         if any(term in name for term in ["BROKER", "PROPERTY BROKER"]):
             entity_label = "BROKER"
         else:
