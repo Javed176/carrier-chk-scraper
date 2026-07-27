@@ -1,4 +1,4 @@
-import os, time, uuid, re, requests, threading, queue, pandas as pd
+import os, time, uuid, re, requests, pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -70,28 +70,44 @@ def get_user_settings(email):
         pass
     return 500.0, 3.0
 
-# --- API CALLER & PARSER ---
-def call_api(mc_number, token):
+# --- ROBUST SINGLE API CALLER WITH BUILT-IN 429 BACKOFF ---
+def get_carrier_info(mc_number, token, retries=6):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
-    try:
-        res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
-        return res.status_code, res.headers, res.json() if res.status_code == 200 else res.text
-    except Exception:
-        return 500, {}, "ERROR"
+    
+    for attempt in range(retries):
+        try:
+            res = http_session.get(CARRIER_API_URL, params=params, timeout=12.0)
+            
+            if res.status_code == 200:
+                return 200, res.json()
+            elif res.status_code in [404, 400]:
+                return res.status_code, {"not_found": True}
+            elif res.status_code == 429:
+                # Rate limited! Back off and sleep right here before giving up
+                sleep_time = 2.5 * (attempt + 1)
+                time.sleep(sleep_time)
+                continue
+            elif res.status_code in [500, 502, 503, 504]:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+        except (requests.exceptions.Timeout, requests.exceptions.RequestException):
+            time.sleep(2.0)
+                
+    return 429, {"throttled": True}
 
 def parse_carrier_data(mc_number, status_code, raw_data):
-    if status_code == 429:
+    if status_code == 429 or (isinstance(raw_data, dict) and raw_data.get("throttled")):
         return {
             "MC Number": f"MC-{mc_number}",
-            "Carrier Name": "⚠️ API THROTTLED",
+            "Carrier Name": "⚠️ API THROTTLED (Retrying)",
             "Entity Type": "N/A",
             "Operating Status": "⚠️ UNKNOWN",
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }, True # Flag as throttled
+        }
 
-    if status_code in [404, 400] or raw_data == "ERROR":
+    if status_code in [404, 400] or not isinstance(raw_data, dict) or raw_data.get("not_found") is True:
         return {
             "MC Number": f"MC-{mc_number}",
             "Carrier Name": "DOCKET NOT FOUND",
@@ -100,9 +116,20 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }, False
+        }
 
-    c = raw_data.get("carrier") or raw_data.get("data") or raw_data if isinstance(raw_data, dict) else {}
+    c = raw_data.get("carrier") or raw_data.get("data") or raw_data
+    if not isinstance(c, dict) or not c:
+        return {
+            "MC Number": f"MC-{mc_number}",
+            "Carrier Name": "DOCKET NOT FOUND",
+            "Entity Type": "N/A",
+            "Operating Status": "❌ NOT FOUND",
+            "Phone Number": "N/A",
+            "Email Address": "N/A",
+            "Location": "N/A"
+        }
+
     name = str(c.get("dba_name") or c.get("legal_name") or c.get("name") or "N/A").strip().upper()
     if name in ["NONE", "NULL", "", "N/A", "NOT FOUND"]:
         return {
@@ -113,7 +140,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Phone Number": "N/A",
             "Email Address": "N/A",
             "Location": "N/A"
-        }, False
+        }
 
     def extract_status(val):
         if isinstance(val, dict):
@@ -172,13 +199,12 @@ def parse_carrier_data(mc_number, status_code, raw_data):
         "Phone Number": phone,
         "Email Address": email,
         "Location": location
-    }, False
+    }
 
 # --- STATE INIT ---
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
-                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
-                 ("thread_status", "Idle"), ("active_mc_normal", "None"), ("active_mc_throttle", "None")]:
+                 ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -309,8 +335,7 @@ if show_admin and st.session_state.is_admin:
         st.subheader("📊 Target User Activity History")
         logs = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(200).execute().data
         if logs:
-            logs_df = pd.DataFrame(logs)
-            st.dataframe(logs_df[["created_at", "email", "action", "detail"]], use_container_width=True)
+            st.dataframe(pd.DataFrame(logs)[["created_at", "email", "action", "detail"]], use_container_width=True)
 
     with t3:
         st.subheader("⚙️ Global Speed Overrides")
@@ -322,9 +347,9 @@ if show_admin and st.session_state.is_admin:
             st.success("Saved!")
             st.rerun()
 
-# --- MAIN TWO-THREAD HARVESTER ENGINE ---
+# --- MAIN LIVE SINGLE-MC HARVESTER ENGINE ---
 if not show_admin:
-    st.title("🚚 Automated Carrier Harvester (Dual-Thread Engine)")
+    st.title("🚚 Automated Carrier Harvester (Live Single-MC Engine)")
     st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
 
     c1, c2 = st.columns(2)
@@ -352,77 +377,30 @@ if not show_admin:
         st.session_state.scraped_rows = []
         st.rerun()
 
-    # --- DUAL-THREAD QUEUE SETUP ---
-    if "q_normal" not in st.session_state: st.session_state.q_normal = queue.Queue()
-    if "q_throttle" not in st.session_state: st.session_state.q_throttle = queue.Queue()
-    if "data_lock" not in st.session_state: st.session_state.data_lock = threading.Lock()
-
+    # --- LIVE RECURSIVE SINGLE-MC RERUN LOOP ---
     status_box = st.empty()
 
-    # Background Workers
-    def normal_worker():
-        while st.session_state.running:
-            try:
-                mc = st.session_state.q_normal.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            
-            st.session_state.active_mc_normal = f"MC-{mc}"
-            code, headers, raw = call_api(mc, CARRIER_TOKEN)
-            parsed, is_throttled = parse_carrier_data(mc, code, raw)
+    if st.session_state.running and st.session_state.current_mc != "":
+        current_mc_val = int(st.session_state.current_mc)
+        
+        status_box.info(f"🔄 **Live Progress:** Processing **MC-{current_mc_val}**...")
 
-            if is_throttled:
-                # Hand off immediately to Thread 2 (Throttle/Sleep Worker)
-                st.session_state.q_throttle.put(mc)
-            else:
-                with st.session_state.data_lock:
-                    st.session_state.scraped_rows.append(parsed)
-                time.sleep(delay_ms / 1000.0)
-            
-            # Queue next sequential MC
-            if st.session_state.running:
-                st.session_state.current_mc = mc + 1
-                st.session_state.q_normal.put(mc + 1)
-            st.session_state.q_normal.task_done()
+        # Fetch and parse single MC
+        status_code, raw_info = get_carrier_info(current_mc_val, CARRIER_TOKEN)
+        parsed = parse_carrier_data(current_mc_val, status_code, raw_info)
 
-    def throttle_worker():
-        while st.session_state.running:
-            try:
-                mc = st.session_state.q_throttle.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            
-            st.session_state.active_mc_throttle = f"MC-{mc} (Throttled - Sleeping)"
-            
-            # Sleep & Backoff specifically for throttled requests
-            backoff_sleep = 4.0
-            time.sleep(backoff_sleep)
-            
-            code, headers, raw = call_api(mc, CARRIER_TOKEN)
-            parsed, is_throttled = parse_carrier_data(mc, code, raw)
+        # Append result to session state
+        st.session_state.scraped_rows.append(parsed)
+        
+        # Advance pointer to next MC
+        st.session_state.current_mc = current_mc_val + 1
 
-            if is_throttled:
-                # Put back in throttle queue if still rate limited
-                st.session_state.q_throttle.put(mc)
-            else:
-                with st.session_state.data_lock:
-                    st.session_state.scraped_rows.append(parsed)
-                st.session_state.active_mc_throttle = "Idle / Cleared"
-            
-            st.session_state.q_throttle.task_done()
+        log_activity(st.session_state.current_user, "search_live_single", f"Harvested MC-{current_mc_val}")
 
-    # Start threads if running
-    if st.session_state.running:
-        if st.session_state.q_normal.empty() and st.session_state.q_throttle.empty():
-            st.session_state.q_normal.put(int(st.session_state.current_mc))
-            
-            t_normal = threading.Thread(target=normal_worker, daemon=True)
-            t_throttle = threading.Thread(target=throttle_worker, daemon=True)
-            t_normal.start()
-            t_throttle.start()
-
-        status_box.info(f"⚡ **Thread 1 (Normal):** Processing `{st.session_state.active_mc_normal}` | 🛑 **Thread 2 (Throttle/Sleep):** `{st.session_state.active_mc_throttle}`")
-        time.sleep(1.0)
+        # Sleep user-configured delay speed
+        time.sleep(delay_ms / 1000.0)
+        
+        # Instant rerun for real-time live UI updates
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
