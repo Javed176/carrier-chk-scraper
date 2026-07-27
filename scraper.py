@@ -159,27 +159,30 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. PRECISE OPERATING STATUS DETECTION ---
-    status_raw = str(find_val_by_keys(c, ["status", "operating_status", "carrier_status", "authority_status"]) or "").upper()
-    common_auth = str(find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority"]) or "").upper()
-    contract_auth = str(find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority"]) or "").upper()
+    # --- 1. STRICT INACTIVE-FIRST OPERATING STATUS DETECTION ---
+    c_text = json.dumps(c).upper()
+    
+    inactive_terms = [
+        "INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", 
+        "OUT OF SERVICE", "CANCELED", "CANCELLED", "DENIED", 
+        "INELIGIBLE", "NOT_AUTHORIZED", "NOT ACTIVE", "NO AUTHORITY"
+    ]
+    
+    # Explicitly check status fields first
+    status_raw = str(find_val_by_keys(c, ["status", "operating_status", "carrier_status", "authority_status", "common_authority_status"]) or "").upper()
     allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
 
-    is_active = True
-    if "INACTIVE" in status_raw or "REVOKED" in status_raw or "SUSPENDED" in status_raw or "CANCEL" in status_raw or "DENIED" in status_raw or status_raw in ["0", "FALSE", "NO", "INACTIVE"]:
+    if any(term in status_raw for term in ["INACTIVE", "REVOKED", "SUSPENDED", "CANCEL", "DENIED", "NO"]):
         is_active = False
     elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
         is_active = False
-    elif "INACTIVE" in common_auth or "INACTIVE" in contract_auth or "NO AUTHORITY" in common_auth:
+    elif any(term in c_text for term in inactive_terms):
         is_active = False
     elif "ACTIVE" in status_raw or "AUTHORIZED" in status_raw or allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
         is_active = True
     else:
-        # Fallback check across entire payload text for negative keywords
-        c_text = json.dumps(c).upper()
-        inactive_terms = ["INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", "OUT OF SERVICE", "CANCELED", "CANCELLED", "DENIED", "INELIGIBLE", "NOT_AUTHORIZED"]
-        if any(term in c_text for term in inactive_terms):
-            is_active = False
+        # Default safe fallback if ambiguous
+        is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
@@ -195,7 +198,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
     is_broker = (
         is_broker_auth or
         "BROKER" in entity_val or
-        "BROKER" in json.dumps(c).upper() or
+        "BROKER" in c_text or
         any(b in name for b in [
             "BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", 
             "CH ROBINSON", "TQL", "RXO", "COYOTE", "UBER FREIGHT"
