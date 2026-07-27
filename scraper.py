@@ -70,6 +70,20 @@ def get_user_settings(email):
         pass
     return 500.0, 3.0
 
+# --- RECURSIVE DICTIONARY SEARCH HELPER ---
+def find_val_by_keys(d, target_keys):
+    if not isinstance(d, dict):
+        return None
+    for k, v in d.items():
+        if k.lower() in [tk.lower() for tk in target_keys]:
+            if v is not None and str(v).strip() != "":
+                return v
+        if isinstance(v, dict):
+            res = find_val_by_keys(v, target_keys)
+            if res is not None:
+                return res
+    return None
+
 # --- ROBUST SINGLE API CALLER WITH BUILT-IN 429 BACKOFF ---
 def get_carrier_info(mc_number, token, retries=6):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
@@ -83,7 +97,6 @@ def get_carrier_info(mc_number, token, retries=6):
             elif res.status_code in [404, 400]:
                 return res.status_code, {"not_found": True}
             elif res.status_code == 429:
-                # Rate limited! Back off and sleep right here before giving up
                 sleep_time = 2.5 * (attempt + 1)
                 time.sleep(sleep_time)
                 continue
@@ -142,23 +155,33 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Location": "N/A"
         }
 
-    def extract_status(val):
-        if isinstance(val, dict):
-            return str(val.get("status") or val.get("desc") or val.get("value") or "").upper()
-        return str(val or "").upper()
+    # --- 1. ROBUST OPERATING STATUS DETECTION ---
+    status_raw = str(find_val_by_keys(c, [
+        "allowed_to_operate", "allowedToOperate", "operating_status", "operatingstatus", 
+        "operating_status_desc", "status", "active", "carrier_status"
+    ]) or "").upper()
 
     def is_strictly_active(val):
-        v = extract_status(val)
+        v = str(val or "").upper()
         if not v or v in ["NONE", "NULL", "N/A", "NO", "FALSE", "DENIED", "N", "REVOKED", "INACTIVE", "DISCONTINUED"]:
             return False
-        return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH"])
+        return v in ["A", "Y", "TRUE", "ACTIVE", "AUTHORIZED", "GRANTED", "AUTHORIZED FOR HIRE"] or any(pos in v for pos in ["ACTIVE", "GRANTED", "AUTH", "ALLOW"])
 
-    common_auth = c.get("common_authority_status") or c.get("commonAuthStatus") or c.get("common_authority")
-    contract_auth = c.get("contract_authority_status") or c.get("contractAuthStatus") or c.get("contract_authority")
-    broker_auth = c.get("broker_authority_status") or c.get("brokerAuthStatus") or c.get("broker_authority")
+    common_auth = find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority", "commonAuthority"])
+    contract_auth = find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority", "contractAuthority"])
+    broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
 
-    is_active = is_strictly_active(common_auth) or is_strictly_active(contract_auth) or is_strictly_active(broker_auth)
+    is_allowed = status_raw in ["Y", "YES", "ACTIVE", "AUTHORIZED", "ALLOWED"] or any(x in status_raw for x in ["AUTH", "ACTIVE", "ALLOW"])
+    is_auth_active = is_strictly_active(common_auth) or is_strictly_active(contract_auth) or is_strictly_active(broker_auth)
+
+    is_active = is_allowed or is_auth_active
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
+
+    # --- 2. ROBUST BROKER VS CARRIER DETECTION ---
+    entity_val = str(find_val_by_keys(c, [
+        "entity_type", "entitytype", "operating_type", "operatingtype", 
+        "carrier_type", "type", "authority_type"
+    ]) or "").upper()
 
     def flatten_dict_values(d):
         vals = []
@@ -172,23 +195,27 @@ def parse_carrier_data(mc_number, status_code, raw_data):
         return vals
 
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
-    explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or "").strip().upper()
-    
-    major_brokers = {"CH ROBINSON": "chrobinson.com", "TQL": "tql.com", "RXO": "rxo.com", "COYOTE LOGISTICS": "coyote.com", "JB HUNT": "jbhunt.com"}
-    is_broker = "BROKER" in explicit_entity_type or any(b in name for b in major_brokers) or is_strictly_active(broker_auth)
+
+    is_broker = (
+        "BROKER" in entity_val or
+        "BROKER" in str(broker_auth or "").upper() or
+        is_strictly_active(broker_auth) or
+        any(b in name for b in ["BROKER", "BROKERAGE", "3PL", "GLOBAL LOGISTICS", "ECHO GLOBAL", "CH ROBINSON", "TQL", "RXO", "COYOTE"])
+    )
     entity_label = "BROKER" if is_broker else "CARRIER"
 
-    phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
-    if phone in ["None", "null", ""]: phone = "N/A"
+    # --- 3. CONTACT INFO & LOCATION ---
+    phone = str(find_val_by_keys(c, ["phone", "cell_phone", "telephone", "phone_number"]) or "N/A").strip()
+    if phone.lower() in ["none", "null", ""]: phone = "N/A"
 
-    email = str(c.get("email_address") or c.get("email") or "").strip()
+    email = str(find_val_by_keys(c, ["email_address", "email", "emailaddress"]) or "").strip()
     if not email or email.lower() in ["none", "null", "not listed", ""]:
         emails_found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', all_payload_text)
         valid_emails = [e for e in emails_found if not any(x in e.lower() for x in ["carrierchk", "example.com"])]
         email = valid_emails[0] if valid_emails else "Not Listed"
 
-    city = str(c.get("phy_city") or c.get("city") or "").strip()
-    state = str(c.get("phy_state") or c.get("state") or "").strip()
+    city = str(find_val_by_keys(c, ["phy_city", "city", "physical_city"]) or "").strip()
+    state = str(find_val_by_keys(c, ["phy_state", "state", "physical_state"]) or "").strip()
     location = f"{city}, {state}".strip(", ") if city or state else "N/A"
 
     return {
