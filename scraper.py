@@ -159,29 +159,26 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. STRICT INACTIVE-FIRST OPERATING STATUS DETECTION ---
-    c_text = json.dumps(c).upper()
-    
-    inactive_terms = [
-        "INACTIVE", "REVOKED", "NOT AUTHORIZED", "SUSPENDED", 
-        "OUT OF SERVICE", "CANCELED", "CANCELLED", "DENIED", 
-        "INELIGIBLE", "NOT_AUTHORIZED", "NOT ACTIVE", "NO AUTHORITY"
-    ]
-    
-    # Explicitly check status fields first
-    status_raw = str(find_val_by_keys(c, ["status", "operating_status", "carrier_status", "authority_status", "common_authority_status"]) or "").upper()
+    # --- 1. PRECISE FIELD-BASED OPERATING STATUS DETECTION ---
+    status_raw = str(find_val_by_keys(c, ["status", "operating_status", "carrier_status", "authority_status"]) or "").upper().strip()
+    common_auth = str(find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority"]) or "").upper().strip()
+    contract_auth = str(find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority"]) or "").upper().strip()
     allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
 
-    if any(term in status_raw for term in ["INACTIVE", "REVOKED", "SUSPENDED", "CANCEL", "DENIED", "NO"]):
+    is_active = True
+
+    if status_raw in ["INACTIVE", "REVOKED", "SUSPENDED", "CANCELED", "CANCELLED", "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE"] or "INACTIVE" in status_raw or "REVOKED" in status_raw or "SUSPENDED" in status_raw:
         is_active = False
     elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
         is_active = False
-    elif any(term in c_text for term in inactive_terms):
+    elif common_auth in ["INACTIVE", "REVOKED", "SUSPENDED", "NOT AUTHORIZED"] or contract_auth in ["INACTIVE", "REVOKED", "SUSPENDED", "NOT AUTHORIZED"]:
         is_active = False
-    elif "ACTIVE" in status_raw or "AUTHORIZED" in status_raw or allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
+    elif status_raw in ["ACTIVE", "AUTHORIZED"] or allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
+        is_active = True
+    elif "ACTIVE" in status_raw and "IN" not in status_raw:
         is_active = True
     else:
-        # Default safe fallback if ambiguous
+        # Default fallback if status is completely missing or ambiguous
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
@@ -195,6 +192,7 @@ def parse_carrier_data(mc_number, status_code, raw_data):
     broker_auth = find_val_by_keys(c, ["broker_authority_status", "brokerAuthStatus", "broker_authority", "brokerAuthority"])
     is_broker_auth = str(broker_auth).upper() in ["Y", "ACTIVE", "AUTHORIZED", "TRUE"]
 
+    c_text = json.dumps(c).upper()
     is_broker = (
         is_broker_auth or
         "BROKER" in entity_val or
