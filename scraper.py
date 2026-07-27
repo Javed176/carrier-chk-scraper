@@ -159,26 +159,25 @@ def parse_carrier_data(mc_number, status_code, raw_data):
             "Raw Payload": raw_data
         }
 
-    # --- 1. PRECISE FIELD-BASED OPERATING STATUS DETECTION ---
-    status_raw = str(find_val_by_keys(c, ["status", "operating_status", "carrier_status", "authority_status"]) or "").upper().strip()
-    common_auth = str(find_val_by_keys(c, ["common_authority_status", "commonAuthStatus", "common_authority"]) or "").upper().strip()
-    contract_auth = str(find_val_by_keys(c, ["contract_authority_status", "contractAuthStatus", "contract_authority"]) or "").upper().strip()
+    # --- 1. BALANCED PRECISE OPERATING STATUS DETECTION ---
+    status_raw = str(find_val_by_keys(c, [
+        "status", "operating_status", "carrier_status", "authority_status", 
+        "common_authority_status", "contract_authority_status"
+    ]) or "").upper().strip()
+    
     allowed_val = find_val_by_keys(c, ["allowed_to_operate", "allowedToOperate", "active", "is_active"])
 
+    inactive_keywords = [
+        "INACTIVE", "REVOKED", "SUSPENDED", "CANCELED", "CANCELLED", 
+        "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE", "NO AUTHORITY", "NOT ACTIVE"
+    ]
+
+    # Assume active by default unless an explicit inactive flag is present
     is_active = True
 
-    if status_raw in ["INACTIVE", "REVOKED", "SUSPENDED", "CANCELED", "CANCELLED", "DENIED", "NOT AUTHORIZED", "OUT OF SERVICE"] or "INACTIVE" in status_raw or "REVOKED" in status_raw or "SUSPENDED" in status_raw:
+    if any(kw in status_raw for kw in inactive_keywords):
         is_active = False
-    elif allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]:
-        is_active = False
-    elif common_auth in ["INACTIVE", "REVOKED", "SUSPENDED", "NOT AUTHORIZED"] or contract_auth in ["INACTIVE", "REVOKED", "SUSPENDED", "NOT AUTHORIZED"]:
-        is_active = False
-    elif status_raw in ["ACTIVE", "AUTHORIZED"] or allowed_val is True or str(allowed_val).upper() in ["Y", "YES", "TRUE", "1"]:
-        is_active = True
-    elif "ACTIVE" in status_raw and "IN" not in status_raw:
-        is_active = True
-    else:
-        # Default fallback if status is completely missing or ambiguous
+    elif allowed_val is not None and (allowed_val is False or str(allowed_val).upper() in ["N", "NO", "FALSE", "0"]):
         is_active = False
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
