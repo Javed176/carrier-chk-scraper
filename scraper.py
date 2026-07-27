@@ -1,4 +1,5 @@
 import os, time, uuid, re, requests, pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
@@ -70,7 +71,7 @@ def get_user_settings(email):
         pass
     return 500.0, 3.0
 
-# --- ANTI-THROTTLE API CALLER ---
+# --- ANTI-THROTTLE PARALLEL API CALLER ---
 def get_carrier_info(mc_number, token, retries=5):
     params = {"type": "mc", "value": str(mc_number).strip(), "token": token}
     
@@ -88,19 +89,19 @@ def get_carrier_info(mc_number, token, retries=5):
                 if retry_after and retry_after.isdigit():
                     time.sleep(float(retry_after))
                 else:
-                    time.sleep(4.0 * (attempt + 1))
+                    time.sleep(2.0 * (attempt + 1))
                 continue
             elif res.status_code in [500, 502, 503, 504]:
                 if attempt < retries - 1:
-                    time.sleep(3.0 * (attempt + 1))
+                    time.sleep(2.0 * (attempt + 1))
                     continue
                 return {"inactive_timeout": True}
             else:
                 if attempt < retries - 1:
-                    time.sleep(2.0 * (attempt + 1))
+                    time.sleep(1.5 * (attempt + 1))
         except (requests.exceptions.Timeout, requests.exceptions.RequestException):
             if attempt < retries - 1:
-                time.sleep(2.5 * (attempt + 1))
+                time.sleep(2.0 * (attempt + 1))
                 
     return "API_ERROR"
 
@@ -197,7 +198,6 @@ def parse_carrier_data(mc_number, raw_data):
     allowed_op = str(c.get("allowed_to_operate") or c.get("allowedToOperate") or "").strip().upper()
     status_field = str(c.get("status") or c.get("status_code") or c.get("statusCode") or c.get("operating_status") or "").strip().upper()
 
-    # --- TOP-DOWN OPERATING STATUS CHECK ---
     if allowed_op in ["N", "NO", "FALSE"] or status_field in ["I", "INACTIVE", "REVOKED", "NOT ACTIVE", "SUSPENDED", "NONE"]:
         is_active = False
     elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
@@ -207,7 +207,6 @@ def parse_carrier_data(mc_number, raw_data):
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
 
-    # --- BULLETPROOF CLASSIFICATION ENGINE ---
     def flatten_dict_values(d):
         vals = []
         for v in d.values():
@@ -248,7 +247,6 @@ def parse_carrier_data(mc_number, raw_data):
     phone = str(c.get("phone") or c.get("cell_phone") or "N/A").strip()
     if phone in ["None", "null", ""]: phone = "N/A"
 
-    # --- DEEP EMAIL EXTRACTION & MAJOR BROKER FALLBACK ---
     email = str(c.get("email_address") or c.get("email") or "").strip()
     email_val = email if email and email.lower() not in ["none", "null", "not listed", ""] else ""
     
@@ -258,7 +256,6 @@ def parse_carrier_data(mc_number, raw_data):
         if valid_emails:
             email_val = valid_emails[0]
 
-    # Fallback for major brokers lacking public registry emails
     if not email_val or email_val.lower() == "not listed":
         for b_name, b_domain in major_brokers.items():
             if b_name in name:
@@ -285,7 +282,7 @@ def parse_carrier_data(mc_number, raw_data):
 for key, val in [("authenticated", False), ("current_user", None), ("session_token", None), 
                  ("is_admin", False), ("login_time", None), ("running", False), 
                  ("scraped_rows", []), ("current_mc", ""), ("last_db_check", 0.0), ("last_session_check", 0.0),
-                 ("auto_retry_enabled", True), ("target_batch_size", 25), ("batch_progress", 0)]:
+                 ("target_batch_size", 25), ("parallel_workers", 5)]:
     if key not in st.session_state: st.session_state[key] = val
 
 def force_logout(reason="Session Expired"):
@@ -297,7 +294,6 @@ def force_logout(reason="Session Expired"):
         st.session_state[k] = False if isinstance(st.session_state[k], bool) else None
     st.session_state.scraped_rows = []
     st.session_state.current_mc = ""
-    st.session_state.batch_progress = 0
 
 def verify_active_session():
     if st.session_state.authenticated and st.session_state.current_user:
@@ -325,7 +321,7 @@ if not st.session_state.authenticated:
             supabase.table("users").update({"active_session_id": token}).eq("email", email_in).execute()
             st.session_state.update({"authenticated": True, "current_user": email_in, "session_token": token,
                                      "is_admin": res.data[0].get("is_admin", False), "login_time": time.time(),
-                                     "scraped_rows": [], "current_mc": "", "batch_progress": 0})
+                                     "scraped_rows": [], "current_mc": ""})
             log_activity(email_in, "login", "Success")
             st.rerun()
         else: st.error("Access denied.")
@@ -479,9 +475,9 @@ if show_admin and st.session_state.is_admin:
             st.success("Global configuration saved!")
             st.rerun()
 
-# --- MAIN HARVESTER ENGINE ---
+# --- MAIN PARALLEL HARVESTER ENGINE ---
 if not show_admin:
-    st.title("🚚 Automated Carrier Harvester")
+    st.title("🚚 Automated Parallel Carrier Harvester")
     st.sidebar.success("CarrierChk API Active" if CARRIER_TOKEN else "Missing API Token")
 
     c1, c2 = st.columns(2)
@@ -494,155 +490,83 @@ if not show_admin:
     with c2:
         st.metric("Session Speed Enforced", speed_str)
 
-    # --- ADVANCED BATCH & RETRY CONFIGURATION ---
-    with st.expander("⚙️ Batch Limits & Auto-Retry Settings", expanded=True):
-        col_ar1, col_ar2 = st.columns(2)
-        
-        st.session_state.target_batch_size = col_ar1.number_input(
-            "Batch Size (MC Count Per Cycle):", 
+    with st.expander("⚙️ Parallel Concurrency & Batch Configuration", expanded=True):
+        c_col1, c_col2 = st.columns(2)
+        st.session_state.target_batch_size = c_col1.number_input(
+            "Batch Size (Total MCs Per Cycle):", 
             min_value=1, 
             max_value=500, 
             value=int(st.session_state.get("target_batch_size", 25)), 
             step=5
         )
-        
-        st.session_state.auto_retry_enabled = col_ar2.checkbox(
-            "🔄 Auto-Retry Throttled MCs At End Of Each Batch", 
-            value=st.session_state.get("auto_retry_enabled", True)
+        st.session_state.parallel_workers = c_col2.number_input(
+            "Parallel Workers (Concurrent Threads):", 
+            min_value=1, 
+            max_value=20, 
+            value=int(st.session_state.get("parallel_workers", 5)), 
+            step=1
         )
 
-    b1, b2, b3, b4 = st.columns(4)
-    if b1.button("🚀 Start Sequence", use_container_width=True):
+    b1, b2, b3 = st.columns(3)
+    if b1.button("🚀 Start Parallel Sequence", use_container_width=True):
         if st.session_state.current_mc != "":
-            st.session_state.batch_progress = 0
             st.session_state.running = True
             st.rerun()
         else: st.error("Enter MC Number first.")
 
     if b2.button("🛑 STOP Sequence", use_container_width=True):
-        if st.session_state.running and st.session_state.batch_progress > 0:
-            start_mc_batch = int(st.session_state.current_mc) - int(st.session_state.batch_progress)
-            end_mc_batch = int(st.session_state.current_mc) - 1
-            if end_mc_batch >= start_mc_batch:
-                log_activity(
-                    st.session_state.current_user,
-                    "search_batch",
-                    f"Searched MC-{start_mc_batch} to MC-{end_mc_batch}"
-                )
         st.session_state.running = False
-        st.session_state.batch_progress = 0
         st.success("Paused sequence.")
 
-    if b3.button("♻️ Manual Retry Throttled", use_container_width=True):
-        retried_count = 0
-        for idx, row in enumerate(st.session_state.scraped_rows):
-            c_name = str(row.get("Carrier Name", "")).upper()
-            op_stat = str(row.get("Operating Status", "")).upper()
-            
-            if "THROTTLED" in c_name or "UNKNOWN" in op_stat or "API_ERROR" in c_name:
-                mc_c = str(row["MC Number"]).replace("MC-", "").strip()
-                st.session_state.scraped_rows[idx] = parse_carrier_data(mc_c, get_carrier_info(mc_c, CARRIER_TOKEN))
-                retried_count += 1
-                time.sleep(1.0)
-                
-        if retried_count > 0:
-            st.success(f"Retried {retried_count} throttled record(s)!")
-        else:
-            st.info("No throttled records to retry.")
-        st.rerun()
-
-    if b4.button("🗑️ Clear Data", use_container_width=True):
+    if b3.button("🗑️ Clear Data", use_container_width=True):
         st.session_state.scraped_rows = []
-        st.session_state.batch_progress = 0
         st.rerun()
 
-    # --- SCRAPING LOOP ---
+    # --- MULTI-THREADED PARALLEL SCRAPING LOOP ---
     if st.session_state.running and st.session_state.current_mc != "":
         st_box = st.empty()
-        target_limit = int(st.session_state.get("target_batch_size", 25))
+        batch_size = int(st.session_state.get("target_batch_size", 25))
+        max_workers = int(st.session_state.get("parallel_workers", 5))
 
-        for _ in range(5):
-            if not st.session_state.running: break
-            
-            target = str(st.session_state.current_mc)
-            st.session_state.batch_progress += 1
-            current_batch_count = st.session_state.batch_progress
+        start_mc = int(st.session_state.current_mc)
+        mc_list = list(range(start_mc, start_mc + batch_size))
 
-            st_box.info(f"⚡ Live Scraping | Target: **MC-{target}** (Item {current_batch_count} of {target_limit} in current batch)...")
-            
-            raw_info = get_carrier_info(target, CARRIER_TOKEN)
-            parsed_record = parse_carrier_data(target, raw_info)
-            st.session_state.scraped_rows.append(parsed_record)
-            st.session_state.current_mc += 1
+        st_box.info(f"⚡ Running Parallel Batch: MC-{mc_list[0]} to MC-{mc_list[-1]} using {max_workers} concurrent threads...")
 
-            # BATCH COMPLETE CHECKPOINT
-            if current_batch_count >= target_limit:
-                start_mc_batch = int(st.session_state.current_mc) - target_limit
-                end_mc_batch = int(st.session_state.current_mc) - 1
+        batch_results = []
 
-                if st.session_state.get("auto_retry_enabled", True):
-                    total_scraped = len(st.session_state.scraped_rows)
-                    start_idx = max(0, total_scraped - target_limit)
+        def worker_fetch(mc):
+            raw_info = get_carrier_info(mc, CARRIER_TOKEN)
+            # If throttled, thread self-heals independently in background without stopping others
+            retry_count = 0
+            while raw_info == "API_ERROR" and retry_count < 3:
+                retry_count += 1
+                time.sleep(1.5 * retry_count)
+                raw_info = get_carrier_info(mc, CARRIER_TOKEN)
+            return parse_carrier_data(mc, raw_info)
 
-                    max_retry_passes = 3
-                    for pass_num in range(1, max_retry_passes + 1):
-                        batch_slice = st.session_state.scraped_rows[start_idx:]
-                        throttled_indices = [
-                            start_idx + i for i, r in enumerate(batch_slice)
-                            if "THROTTLED" in str(r.get("Carrier Name", "")).upper() 
-                            or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
-                        ]
+        # Execute threads in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_mc = {executor.submit(worker_fetch, mc): mc for mc in mc_list}
+            for future in as_completed(future_to_mc):
+                try:
+                    res = future.result()
+                    batch_results.append(res)
+                except Exception:
+                    pass
 
-                        if not throttled_indices:
-                            break
+        # Append results and increment pointer
+        st.session_state.scraped_rows.extend(batch_results)
+        st.session_state.current_mc = start_mc + batch_size
 
-                        cool_down = 4.0 * pass_num
-                        st_box.warning(
-                            f"🛑 Batch complete. Found {len(throttled_indices)} throttled record(s). "
-                            f"Retry Pass {pass_num}/{max_retry_passes}: Cooling down {cool_down:.1f}s..."
-                        )
-                        time.sleep(cool_down)
-
-                        for count, idx in enumerate(throttled_indices, start=1):
-                            retry_mc = str(st.session_state.scraped_rows[idx]["MC Number"]).replace("MC-", "").strip()
-                            st_box.info(f"🔄 Retrying MC-{retry_mc} (Pass {pass_num} | {count}/{len(throttled_indices)})...")
-
-                            new_raw = get_carrier_info(retry_mc, CARRIER_TOKEN)
-                            new_parsed = parse_carrier_data(retry_mc, new_raw)
-                            st.session_state.scraped_rows[idx] = new_parsed
-                            time.sleep(2.0)
-
-                    final_slice = st.session_state.scraped_rows[start_idx:]
-                    remaining_throttled = sum(
-                        1 for r in final_slice 
-                        if "THROTTLED" in str(r.get("Carrier Name", "")).upper() or "UNKNOWN" in str(r.get("Operating Status", "")).upper()
-                    )
-
-                    if remaining_throttled == 0:
-                        st_box.success(f"✅ Batch complete! All MCs verified with 0 throttled errors. Continuing next batch starting from MC-{st.session_state.current_mc}...")
-                    else:
-                        st_box.warning(f"⚠️ Batch finished with {remaining_throttled} persistent throttle error(s). Continuing next batch starting from MC-{st.session_state.current_mc}...")
-
-                    time.sleep(1.5)
-                else:
-                    st_box.info(f"🛑 Batch complete! Continuing next batch starting from MC-{st.session_state.current_mc}...")
-                    time.sleep(1.5)
-
-                log_activity(
-                    st.session_state.current_user,
-                    "search_batch",
-                    f"Searched MC-{start_mc_batch} to MC-{end_mc_batch}"
-                )
-
-                st.session_state.batch_progress = 0
-                st.rerun()
-                break
-
-            if "THROTTLED" in str(parsed_record.get("Carrier Name")).upper() or raw_info == "API_ERROR":
-                st_box.warning(f"⚠️ Throttling detected on MC-{target}. Auto cooling down 4.0s...")
-                time.sleep(4.0)
-            else:
-                time.sleep(max(0.3, delay_ms / 1000.0))
+        st_box.success(f"✅ Parallel Batch Complete! Logged MC-{mc_list[0]} to MC-{mc_list[-1]}.")
+        log_activity(
+            st.session_state.current_user,
+            "search_batch",
+            f"Parallel batch searched MC-{mc_list[0]} to MC-{mc_list[-1]}"
+        )
+        
+        time.sleep(0.5)
         st.rerun()
 
     # --- FILTERING & DISPLAY ---
@@ -724,4 +648,4 @@ if not show_admin:
             else:
                 st.info("No active emails matching current filters.")
     else:
-        st.info("No records collected yet. Click 'Start Sequence' to begin harvesting.")
+        st.info("No records collected yet. Click 'Start Parallel Sequence' to begin harvesting.")
