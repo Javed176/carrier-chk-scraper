@@ -203,6 +203,7 @@ def parse_carrier_data(mc_number, raw_data):
     elif allowed_op in ["Y", "YES", "TRUE"] or status_field in ["A", "ACTIVE", "AUTHORIZED"]:
         is_active = True
     else:
+        # If no explicit active flag is set, require at least one active authority
         is_active = has_common_active or has_contract_active or has_broker_active
 
     status_str = "🟢 ACTIVE" if is_active else "🔴 INACTIVE"
@@ -224,11 +225,11 @@ def parse_carrier_data(mc_number, raw_data):
         return vals
 
     all_payload_text = " ".join(flatten_dict_values(c)).upper()
+    explicit_entity_type = str(c.get("entity_type") or c.get("entityType") or c.get("type") or "").strip().upper()
 
-    # Hard override for major known 3PLs/Brokers
     major_brokers = ["CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", "RXO", "COYOTE LOGISTICS", "JB HUNT"]
     
-    if any(b in name for b in major_brokers) or "BROKER" in all_payload_text or has_broker_active:
+    if "BROKER" in explicit_entity_type or any(b in name for b in major_brokers) or "BROKER" in all_payload_text or has_broker_active:
         entity_label = "BROKER"
     else:
         entity_label = "CARRIER"
@@ -620,8 +621,8 @@ if not show_admin:
     # --- FILTERING & DISPLAY ---
     st.markdown("---")
     if st.session_state.scraped_rows:
-        # Instant Session Data Correction Pass for Major Brokers
-        major_brokers = ["CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", "RXO", "COYOTE LOGISTICS", "JB HUNT"]
+        # Instant Session Correction Pass for Brokers & Inactive Statuses
+        major_brokers = ["CH ROBINSON", "C.H. ROBINSON", "TQL", "TOTAL QUALITY LOGISTICS", "RXO", "COYOTE LOGISTICS", "JB HUNT", "COSMOS OF LONDON"]
         for r in st.session_state.scraped_rows:
             c_name = str(r.get("Carrier Name", "")).upper()
             if any(b in c_name for b in major_brokers):
